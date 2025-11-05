@@ -25,11 +25,11 @@
 "ANNEAL_LR": True
 "SEED": 30
 "NUM_SEEDS": 1
-"True": True
+"TUNE": True
 
 "REWARD": "individual" # individual; common
 "GIF_NUM_FRAMES": 250
-"PARAMETER_SHARING": True
+"PARAMETER_SHARING": False
 
 # WandB Params
 "ENTITY": ""

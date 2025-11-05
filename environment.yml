@@ -1,4 +1,4 @@
-name: SocialJax
+name: SocialJax_yml
 channels:
   - conda-forge
 dependencies:
