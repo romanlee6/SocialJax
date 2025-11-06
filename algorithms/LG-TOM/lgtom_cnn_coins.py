@@ -1,5 +1,48 @@
 """ 
-Based on PureJaxRL & jaxmarl Implementation of PPO
+Based on PureJaxRL & jaxmarl Implementation of PPO with LG-TOM Communication
+
+This implementation includes Social Influence Intrinsic Reward via Counterfactual Reasoning:
+
+SOCIAL INFLUENCE MECHANISM:
+---------------------------
+The social influence reward measures how much an agent's communication affects other agents'
+behaviors or beliefs through counterfactual reasoning.
+
+Key Components:
+1. Counterfactual Generation (generate_counterfactuals):
+   - For each agent k and each possible message v, we compute:
+     "What would other agents j do/believe if agent k sent message v?"
+   - This is done by:
+     a) Replacing agent k's communication with each prototype message
+     b) Running other agents' forward pass with the counterfactual communication
+     c) Recording their resulting actions or belief states
+
+2. Marginalization (marginalize_over_own_comm):
+   - Compute expected influence by marginalizing over agent k's communication policy:
+     E_{m ~ π_comm(m|s_k)}[prediction(s_j | m_k=m)]
+   - This gives us the expected behavior/belief of agent j given k's comm distribution
+
+3. Influence Reward Computation (compute_social_influence_reward):
+   - Measure influence as the difference between:
+     * Marginalized counterfactual predictions (what others would do on average)
+     * Actual predictions (what others actually do)
+   - Higher difference = higher influence = agent's communication matters more
+   - Uses cosine similarity: influence = 1 - similarity
+
+Configuration Options:
+- SOCIAL_INFLUENCE_COEFF: Weight for intrinsic reward (0.0 = disabled)
+- INFLUENCE_TARGET: What to measure influence on
+  * "belief": Measure impact on other agents' belief states (GRU output, not hidden state)
+  * "action": Measure impact on other agents' action distributions
+
+Implementation Notes:
+- Parameter Sharing: Uses agent's own policy to predict others (homogeneous assumption)
+- Decentralized: Requires opponent modeling (placeholder for future implementation)
+- JAX-compatible: All operations use JAX for automatic differentiation and JIT compilation
+
+Based on Theory of Mind (ToM) and counterfactual reasoning from:
+- TOM-MAC architecture (mac_tom.py)
+- Social Influence in multi-agent communication
 """
 import sys
 sys.path.append('/home/huao/Research/SocialJax')
@@ -179,7 +222,10 @@ class ActorCriticComm(nn.Module):
             bias_init=constant(0.0)
         )(critic)
         
-        return action_logits, comm_vector, comm_logits, jnp.squeeze(value, axis=-1), new_hidden_state
+        # Return both belief and new_hidden_state
+        # belief: the GRU output used for action/comm generation
+        # new_hidden_state: the carry state for next timestep
+        return action_logits, comm_vector, comm_logits, jnp.squeeze(value, axis=-1), new_hidden_state, belief
 
 
 class ActorCritic(nn.Module):
@@ -333,6 +379,209 @@ def aggregate_communication(comm_vectors, num_agents, comm_mode='avg'):
     return aggregated_comm
 
 
+def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden_batch, 
+                            proto_embeddings, num_agents, num_protos, comm_dim, config, rng):
+    """
+    Generate counterfactual predictions for what other agents would do/believe
+    under each possible communication from the current agent.
+    
+    This implements counterfactual reasoning: "If I send message m, how would others respond?"
+    
+    Dimension flow:
+    1. Input: (num_envs * num_agents, ...) 
+    2. Reshaped: (num_envs, num_agents, ...)
+    3. Tiled: (num_agents * num_protos * num_envs, num_agents, ...)
+    4. Flattened: (num_agents * num_protos * num_envs * num_agents, ...) for forward pass
+    5. Reshaped back: (num_agents, num_protos, num_envs, num_agents, ...)
+    6. Averaged: (num_agents, num_protos, num_agents, output_dim)
+    
+    Args:
+        network: The ActorCriticComm network
+        params: Network parameters
+        obs_batch: Observations (num_envs * num_agents, ...)
+        prev_comm_batch: Previous communications (num_envs * num_agents, comm_dim)
+        hidden_batch: Hidden states (num_envs * num_agents, hidden_dim)
+        proto_embeddings: Prototype embeddings (num_protos, comm_dim)
+        num_agents: Number of agents
+        num_protos: Number of prototype messages
+        comm_dim: Communication dimension
+        config: Configuration dict
+        rng: Random key
+        
+    Returns:
+        counterfactuals: (num_agents, num_protos, num_agents, output_dim)
+            where output_dim is:
+            - action_dim (for action influence): action probability distribution
+            - hidden_dim (for belief influence): GRU output (belief), not hidden state
+    """
+    num_envs = obs_batch.shape[0] // num_agents
+    
+    # Reshape to (num_envs, num_agents, ...)
+    obs_reshaped = obs_batch.reshape(num_envs, num_agents, *obs_batch.shape[1:])
+    prev_comm_reshaped = prev_comm_batch.reshape(num_envs, num_agents, comm_dim)
+    hidden_reshaped = hidden_batch.reshape(num_envs, num_agents, -1)
+    
+    # For each agent k and each prototype v, compute counterfactual predictions
+    # We need predictions for all agents in each scenario
+    # Total batch size: num_agents (which agent sends) * num_protos (which message) * num_envs * num_agents (predictions for each agent)
+    batch_size = num_agents * num_protos * num_envs * num_agents
+    
+    # Repeat observations for all counterfactual scenarios
+    # After tiling: (num_agents * num_protos * num_envs, num_agents, ...)
+    obs_repeated = jnp.tile(obs_reshaped, (num_agents * num_protos, 1, 1, 1, 1))
+    # Flatten to (num_agents * num_protos * num_envs * num_agents, ...)
+    obs_repeated = obs_repeated.reshape(-1, *obs_batch.shape[1:])
+    
+    # Same for hidden states
+    hidden_repeated = jnp.tile(hidden_reshaped, (num_agents * num_protos, 1, 1))
+    hidden_repeated = hidden_repeated.reshape(-1, hidden_reshaped.shape[-1])
+    
+    # Create counterfactual communications
+    # For each (agent_k, proto_v), replace agent_k's comm with proto_v
+    comm_counterfactual = jnp.tile(prev_comm_reshaped, (num_agents * num_protos, 1, 1))
+    
+    # Generate indices for replacement
+    agent_indices = jnp.arange(num_agents).repeat(num_protos * num_envs)
+    proto_indices = jnp.tile(jnp.arange(num_protos).repeat(num_envs), num_agents)
+    env_indices = jnp.tile(jnp.arange(num_envs), num_agents * num_protos)
+    
+    # Replace with prototype embeddings
+    batch_indices = jnp.arange(batch_size) // (num_envs * num_agents)
+    comm_counterfactual = comm_counterfactual.at[
+        jnp.arange(num_agents * num_protos * num_envs), 
+        agent_indices
+    ].set(proto_embeddings[proto_indices])
+    
+    # Aggregate counterfactual communications
+    comm_counterfactual_reshaped = comm_counterfactual.reshape(
+        num_agents * num_protos * num_envs, num_agents, comm_dim
+    )
+    aggregated_comm = jax.vmap(
+        lambda c: aggregate_communication(
+            jnp.expand_dims(c, 0), num_agents, config.get("COMM_MODE", "avg")
+        ).squeeze(0)
+    )(comm_counterfactual_reshaped)
+    
+    # aggregated_comm shape: (num_agents * num_protos * num_envs, num_agents, comm_dim)
+    # Flatten to (num_agents * num_protos * num_envs * num_agents, comm_dim)
+    aggregated_comm_flat = aggregated_comm.reshape(-1, comm_dim)
+    
+    # Forward pass through network to get counterfactual predictions
+    rng_split = jax.random.split(rng, batch_size)
+    action_logits_cf, _, _, _, hidden_cf, belief_cf = jax.vmap(
+        lambda obs, comm, hid, r: network.apply(
+            params,
+            jnp.expand_dims(obs, 0),
+            jnp.expand_dims(comm, 0),
+            jnp.expand_dims(hid, 0),
+            train_mode=False,
+            rngs={'gumbel': r}
+        )
+    )(obs_repeated, aggregated_comm_flat, hidden_repeated, rng_split)
+    
+    # Reshape to (num_agents, num_protos, num_envs, num_agents, ...)
+    action_logits_cf = action_logits_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
+    belief_cf = belief_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
+    
+    # Average over environments
+    if config.get("INFLUENCE_TARGET", "belief") == "action":
+        # Return action probabilities
+        action_probs = jax.nn.softmax(action_logits_cf, axis=-1)
+        return action_probs.mean(axis=2)  # (num_agents, num_protos, num_agents, action_dim)
+    else:
+        # Return belief states (GRU output, not hidden state)
+        return belief_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
+
+
+def marginalize_over_own_comm(comm_probs, counterfactuals, epsilon=1e-8):
+    """
+    Marginalize counterfactual predictions over agent's own communication distribution.
+    
+    This computes: E_{m ~ π_comm(m|s_k)}[prediction(s_j | m_k=m)]
+    
+    Args:
+        comm_probs: (num_envs * num_agents, num_protos) - communication probabilities
+        counterfactuals: (num_agents, num_protos, num_agents, output_dim)
+        
+    Returns:
+        marginal: (num_agents, num_agents, output_dim) - marginalized predictions
+    """
+    num_agents = counterfactuals.shape[0]
+    num_protos = counterfactuals.shape[1]
+    output_dim = counterfactuals.shape[-1]
+    
+    # Reshape comm_probs to (num_agents, num_protos)
+    # Assuming single environment or averaged
+    comm_probs_reshaped = comm_probs.reshape(-1, num_agents, num_protos).mean(axis=0)
+    
+    # Weighted sum: (k, j, d)
+    # marginal[k, j] = sum_v comm_probs[k, v] * counterfactuals[k, v, j]
+    marginal = jnp.einsum('kv,kvjd->kjd', comm_probs_reshaped, counterfactuals)
+    
+    # Normalize
+    norm = comm_probs_reshaped.sum(axis=1, keepdims=True)[..., None] + epsilon
+    marginal = marginal / norm
+    
+    return marginal
+
+
+def compute_social_influence_reward(belief_states, comm_logits, counterfactuals, 
+                                    actual_outputs, config):
+    """
+    Compute social influence intrinsic reward.
+    
+    Measures how much an agent's communication changes other agents' behaviors/beliefs.
+    
+    Args:
+        belief_states: (num_envs * num_agents, hidden_dim) - current belief states
+        comm_logits: (num_envs * num_agents, num_protos) - communication logits
+        counterfactuals: (num_agents, num_protos, num_agents, output_dim)
+        actual_outputs: (num_envs * num_agents, output_dim) - actual actions or beliefs
+        config: Configuration dict
+        
+    Returns:
+        influence_reward: (num_agents,) - influence reward for each agent
+    """
+    num_agents = counterfactuals.shape[0]
+    
+    # Get communication probabilities
+    comm_probs = jax.nn.softmax(comm_logits, axis=-1)
+    
+    # Marginalize counterfactuals over own communication
+    marginal_predictions = marginalize_over_own_comm(comm_probs, counterfactuals)
+    
+    # Reshape actual outputs to (num_agents, output_dim)
+    actual_outputs_reshaped = actual_outputs.reshape(-1, num_agents, actual_outputs.shape[-1]).mean(axis=0)
+    
+    # Expand actual outputs to compare with marginal predictions
+    # actual_outputs[k, j] should be agent j's actual output
+    actual_expanded = jnp.tile(
+        jnp.expand_dims(actual_outputs_reshaped, 0), 
+        (num_agents, 1, 1)
+    )  # (num_agents, num_agents, output_dim)
+    
+    # Compute influence as difference between marginal and actual
+    # Using cosine similarity (1 - similarity = influence)
+    # Higher influence means communication changes others' behaviors more
+    sim = jax.vmap(
+        lambda pred, actual: jax.vmap(
+            lambda p, a: jnp.dot(p, a) / (jnp.linalg.norm(p) * jnp.linalg.norm(a) + 1e-8)
+        )(pred, actual)
+    )(marginal_predictions, actual_expanded)
+    
+    # 1 - similarity gives influence
+    influence = 1.0 - sim
+    
+    # Mask out self-influence (diagonal)
+    mask = ~jnp.eye(num_agents, dtype=bool)
+    masked_influence = jnp.where(mask, influence, 0.0)
+    
+    # Average influence over other agents
+    influence_reward = masked_influence.sum(axis=1) / (num_agents - 1)
+    
+    return influence_reward
+
+
 def make_train_comm(config):
     """Training function with communication mechanism"""
     env = socialjax.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -448,7 +697,7 @@ def make_train_comm(config):
                     prev_comm_batch = prev_comm.reshape(-1, config.get("COMM_DIM", 64))
                     
                     # Forward pass through network
-                    action_logits, comm_vectors, comm_logits, values, new_hidden_batch = network.apply(
+                    action_logits, comm_vectors, comm_logits, values, new_hidden_batch, belief_batch = network.apply(
                         train_state.params,
                         obs_batch,
                         prev_comm_batch,
@@ -486,7 +735,7 @@ def make_train_comm(config):
                     
                     for i in range(env.num_agents):
                         # Forward pass for agent i
-                        action_logits_i, comm_vectors_i, comm_logits_i, values_i, new_hidden_i = network[i].apply(
+                        action_logits_i, comm_vectors_i, comm_logits_i, values_i, new_hidden_i, _ = network[i].apply(
                             train_state[i].params,
                             obs_batch[i],
                             prev_comm[:, i],
@@ -528,6 +777,75 @@ def make_train_comm(config):
                     comm_mode=config.get("COMM_MODE", "avg")
                 )
                 
+                # Compute social influence intrinsic reward (if enabled)
+                influence_reward_batch = jnp.zeros((config["NUM_ACTORS"],))
+                if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
+                    if config.get("PARAMETER_SHARING", True):
+                        # PARAMETER SHARING CASE:
+                        # In parameter sharing, we can directly use the agent's own policy
+                        # to compute counterfactual predictions for other agents
+                        
+                        # Extract prototype embeddings from network parameters
+                        proto_embeddings = train_state.params['params']['ProtoLayer_0']['prototypes']
+                        
+                        # Generate counterfactuals
+                        rng, _rng_cf = jax.random.split(rng)
+                        counterfactuals = generate_counterfactuals(
+                            network=network,
+                            params=train_state.params,
+                            obs_batch=obs_batch,
+                            prev_comm_batch=prev_comm_batch,
+                            hidden_batch=hidden_batch,
+                            proto_embeddings=proto_embeddings,
+                            num_agents=env.num_agents,
+                            num_protos=config.get("NUM_PROTOS", 10),
+                            comm_dim=config.get("COMM_DIM", 64),
+                            config=config,
+                            rng=_rng_cf
+                        )
+                        
+                        # Determine what to measure influence on
+                        if config.get("INFLUENCE_TARGET", "belief") == "action":
+                            actual_outputs = action_logits
+                        else:
+                            # Use belief output from GRU, not hidden state
+                            actual_outputs = belief_batch
+                        
+                        # Compute influence reward
+                        influence_reward = compute_social_influence_reward(
+                            belief_states=hidden_batch,
+                            comm_logits=comm_logits,
+                            counterfactuals=counterfactuals,
+                            actual_outputs=actual_outputs,
+                            config=config
+                        )
+                        
+                        # Expand influence reward to match batch size
+                        # Shape: (num_agents,) -> (num_envs, num_agents) -> (num_envs * num_agents,)
+                        influence_reward_expanded = jnp.tile(
+                            influence_reward, 
+                            config["NUM_ENVS"]
+                        ).reshape(-1)
+                        
+                        influence_reward_batch = influence_reward_expanded
+                    else:
+                        # DECENTRALIZED CASE (NON-PARAMETER SHARING):
+                        # TODO: Implementation for decentralized agents
+                        # In this case, agents have separate policies and we would need to:
+                        # 1. Maintain models of other agents' policies (opponent modeling)
+                        # 2. Use these models to compute counterfactual predictions
+                        # 3. Alternatively, use learned world models or approximate methods
+                        # 
+                        # Placeholder: For now, set influence reward to zero
+                        # Future work: Implement opponent modeling or other approximation methods
+                        influence_reward_batch = jnp.zeros((config["NUM_ACTORS"],))
+                        
+                        # NOTE: Possible approaches for decentralized influence:
+                        # - Learn separate opponent models for each other agent
+                        # - Use population-based training with saved checkpoints
+                        # - Approximate using recent interaction history
+                        # - Use meta-learning to predict other agents' responses
+                
                 # Prepare actions for environment
                 env_act = [v for v in env_act.values()]
                 
@@ -539,6 +857,15 @@ def make_train_comm(config):
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
                 
+                # Add social influence intrinsic reward to environment reward
+                env_reward = batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze()
+                total_reward = env_reward + config.get("SOCIAL_INFLUENCE_COEFF", 0.0) * influence_reward_batch
+                
+                # Store influence reward in info for logging
+                if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
+                    info['social_influence_reward'] = influence_reward_batch.reshape(config["NUM_ENVS"], env.num_agents)
+                    info['env_reward_only'] = env_reward.reshape(config["NUM_ENVS"], env.num_agents)
+                
                 # Store transition
                 if config.get("PARAMETER_SHARING", True):
                     info = jax.tree_util.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
@@ -546,7 +873,7 @@ def make_train_comm(config):
                         batchify_dict(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                         actions,
                         values,
-                        batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                        total_reward,
                         log_probs,
                         obs_batch,
                         comm_vectors,
@@ -587,7 +914,7 @@ def make_train_comm(config):
                 last_hidden_batch = hidden_states.reshape(-1, config.get("HIDDEN_DIM", 128))
                 last_comm_batch = prev_comm.reshape(-1, config.get("COMM_DIM", 64))
                 
-                _, _, _, last_val, _ = network.apply(
+                _, _, _, last_val, _, _ = network.apply(
                     train_state.params,
                     last_obs_batch,
                     last_comm_batch,
@@ -599,7 +926,7 @@ def make_train_comm(config):
                 last_obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
                 last_val = []
                 for i in range(env.num_agents):
-                    _, _, _, last_val_i, _ = network[i].apply(
+                    _, _, _, last_val_i, _, _ = network[i].apply(
                         train_state[i].params,
                         last_obs_batch[i],
                         prev_comm[:, i],
@@ -664,7 +991,7 @@ def make_train_comm(config):
                         aggregated = aggregate_communication(comm_reshaped, env.num_agents, config.get("COMM_MODE", "avg"))
                         prev_comm_recon = aggregated.reshape(batch_size, comm_dim)
                         
-                        action_logits, _, _, values, _ = network_used.apply(
+                        action_logits, _, _, values, _, _ = network_used.apply(
                             params,
                             traj_batch.obs,
                             prev_comm_recon,
@@ -789,6 +1116,23 @@ def make_train_comm(config):
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
             metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+            
+            # Log social influence rewards separately if enabled
+            if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
+                try:
+                    if "social_influence_reward" in metric:
+                        # Convert to Python scalar for WandB
+                        metric["intrinsic_reward/social_influence"] = float(metric["social_influence_reward"])
+                    if "env_reward_only" in metric:
+                        # Convert to Python scalar for WandB
+                        metric["extrinsic_reward/environment"] = float(metric["env_reward_only"])
+                    # Log the coefficient for reference
+                    metric["intrinsic_reward/influence_coeff"] = float(config.get("SOCIAL_INFLUENCE_COEFF", 0.0))
+                    metric["intrinsic_reward/influence_target"] = 1.0 if config.get("INFLUENCE_TARGET", "belief") == "belief" else 0.0
+                except (KeyError, TypeError) as e:
+                    # If metrics don't exist yet or can't be converted, skip logging them
+                    pass
+            
             jax.debug.callback(callback, metric)
             
             runner_state = (train_state, env_state, last_obs, hidden_states, prev_comm, update_step, rng)
@@ -1299,7 +1643,7 @@ def evaluate_comm(params, env, save_path, config):
         rng, _rng = jax.random.split(rng)
         
         if config.get("PARAMETER_SHARING", True):
-            action_logits, comm_vectors, _, _, new_hidden_states = network.apply(
+            action_logits, comm_vectors, _, _, new_hidden_states, _ = network.apply(
                 params,
                 obs_batch,
                 prev_comm,
@@ -1319,7 +1663,7 @@ def evaluate_comm(params, env, save_path, config):
             new_hidden_list = []
             
             for i in range(env.num_agents):
-                action_logits_i, comm_vectors_i, _, _, new_hidden_i = network[i].apply(
+                action_logits_i, comm_vectors_i, _, _, new_hidden_i, _ = network[i].apply(
                     params[i],
                     jnp.expand_dims(obs_batch[i], axis=0),
                     jnp.expand_dims(prev_comm[i], axis=0),
@@ -1473,41 +1817,45 @@ def evaluate(params, env, save_path, config):
 
 def tune(default_config):
     """
-    Hyperparameter sweep with wandb, including logic to:
-    - Initialize wandb
-    - Train for each hyperparameter set
-    - Save checkpoint
-    - Evaluate and log GIF
+    Hyperparameter sweep with wandb for social influence experiments.
     
-    Current sweep: PARAMETER_SHARING × Reward Type × Seeds
+    Experiments:
+    - Reward structure: Individual only
+    - Influence target: Belief vs Action states  
+    - Social influence coefficient: 0.01 vs 0.1
+    - Seeds: 3 different random seeds
+    
+    Current sweep: Influence Target × Coefficient × Seeds
     Total runs: 2 × 2 × 3 = 12 experiments
+    
+    Each experiment trains with communication and parameter sharing.
     """
     import copy
 
     default_config = OmegaConf.to_container(default_config)
 
     sweep_config = {
-        "name": "lgtom_comm_sweep",
+        "name": "lgtom_social_influence_sweep",
         "method": "grid",  # Try all combinations
         "metric": {
             "name": "returned_episode_returns",
             "goal": "maximize",
         },
         "parameters": {
-            # Main sweep parameters
-            "PARAMETER_SHARING": {"values": [True, False]},
-            "ENV_KWARGS.shared_rewards": {"values": [False, True]},  # False=individual, True=common
-            "SEED": {"values": [42, 52, 62]},
+            # Main sweep parameters for social influence experiments
+            "PARAMETER_SHARING": {"values": [True]},  # Required for social influence
+            "ENV_KWARGS.shared_rewards": {"values": [False]},  # Only individual rewards
+            "INFLUENCE_TARGET": {"values": ["belief", "action"]},  # What to measure influence on
+            "SOCIAL_INFLUENCE_COEFF": {"values": [0.01, 0.1]},  # Two coefficient values
+            "SEED": {"values": [42, 52, 62]},  # Three different seeds
             
-            # Optional: Other hyperparameters to sweep (currently commented)
-            # "LR": {"values": [0.001, 0.0005, 0.0001]},
-            # "ACTIVATION": {"values": ["relu", "tanh"]},
-            # "UPDATE_EPOCHS": {"values": [2, 4, 8]},
-            # "NUM_MINIBATCHES": {"values": [4, 8, 16, 32]},
-            # "CLIP_EPS": {"values": [0.1, 0.2, 0.3]},
-            # "ENT_COEF": {"values": [0.001, 0.01, 0.1]},
-            # "COMM_DIM": {"values": [32, 64, 128]},
-            # "NUM_PROTOS": {"values": [5, 10, 20]},
+            # Total runs: 1 × 1 × 2 × 2 × 3 = 12 experiments
+            # 
+            # Experiment matrix:
+            # - Reward structure: individual only
+            # - Influence target: belief vs action
+            # - Influence coefficient: 0.01 vs 0.1
+            # - Seeds: 42, 52, 62
         },
     }
 
@@ -1528,29 +1876,35 @@ def tune(default_config):
         
         # Build descriptive run name
         param_sharing_str = "ps" if config.get("PARAMETER_SHARING", True) else "ind"
-        reward_str = "common" if config["ENV_KWARGS"].get("shared_rewards", False) else "individual"
+        reward_str = "shared" if config["ENV_KWARGS"].get("shared_rewards", False) else "individual"
         use_comm = config.get("USE_COMM", False)
-        comm_str = "comm" if use_comm else "ippo"
         
-        run_name = f"{comm_str}_{param_sharing_str}_{reward_str}_seed{config['SEED']}"
+        # Social influence parameters
+        influence_coeff = config.get("SOCIAL_INFLUENCE_COEFF", 0.0)
+        influence_target = config.get("INFLUENCE_TARGET", "belief")
+        
+        # Build run name with all key parameters
+        if influence_coeff > 0:
+            influence_str = f"si{influence_coeff}_{influence_target}"
+        else:
+            influence_str = "no_si"
+        
+        run_name = f"lgtom_{param_sharing_str}_{reward_str}_{influence_str}_s{config['SEED']}"
         wandb.run.name = run_name
         
         # Update tags based on configuration
-        tags = []
-        if use_comm:
-            tags.extend(["LGTOM", "COMM"])
-        else:
-            tags.extend(["IPPO", "FF"])
-        
-        if config.get("PARAMETER_SHARING", True):
-            tags.append("PS")
-        else:
-            tags.append("IND")
+        tags = ["LGTOM", "COMM", "PS"]  # Always communication with parameter sharing
         
         if config["ENV_KWARGS"].get("shared_rewards", False):
-            tags.append("COMMON_REWARD")
+            tags.append("SHARED_REWARD")
         else:
             tags.append("INDIVIDUAL_REWARD")
+        
+        if influence_coeff > 0:
+            tags.append("SOCIAL_INFLUENCE")
+            tags.append(f"INFLUENCE_{influence_target.upper()}")
+        else:
+            tags.append("NO_INFLUENCE")
         
         wandb.run.tags = tags
         
@@ -1558,6 +1912,8 @@ def tune(default_config):
         print(f"Running experiment: {run_name}")
         print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', True)}")
         print(f"  Reward Type: {reward_str}")
+        print(f"  Social Influence Coeff: {influence_coeff}")
+        print(f"  Influence Target: {influence_target}")
         print(f"  Seed: {config['SEED']}")
         print(f"  Total Timesteps: {config['TOTAL_TIMESTEPS']:.0e}")
         print(f"  Tags: {tags}")
@@ -1596,13 +1952,18 @@ def tune(default_config):
     )
     
     print("\n" + "="*70)
-    print("Starting WandB Sweep")
+    print("Starting WandB Sweep: Social Influence Experiments")
     print(f"Sweep ID: {sweep_id}")
-    print(f"Total Combinations: 2 (PARAMETER_SHARING) × 2 (Reward) × 3 (Seeds) = 12 runs")
+    print(f"Total Combinations:")
+    print(f"  - Reward structure: individual only")
+    print(f"  - Influence target: 2 (belief, action)")
+    print(f"  - Influence coefficient: 2 (0.01, 0.1)")
+    print(f"  - Seeds: 3 (42, 52, 62)")
+    print(f"  - Total: 2 × 2 × 3 = 12 runs")
     print(f"Timesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
     print("="*70 + "\n")
     
-    # Run sweep agent (count=12 for all combinations, or higher if you want retries)
+    # Run sweep agent (count=12 for all combinations)
     wandb.agent(sweep_id, wrapped_make_train, count=12)
 
 

@@ -38,6 +38,10 @@
 "HIDDEN_DIM": 128  # Hidden dimension for GRU (must be embedding_dim + comm_dim = 64 + 64)
 "COMM_MODE": "avg"  # Communication aggregation mode: 'avg' or 'sum'
 
+# Social Influence Intrinsic Reward Parameters
+"SOCIAL_INFLUENCE_COEFF": 0.1  # Coefficient for social influence intrinsic reward
+"INFLUENCE_TARGET": "belief"  # What to measure influence on: "action" or "belief"
+
 # WandB Params
 "ENTITY": ""
 "PROJECT": "socialjax"
