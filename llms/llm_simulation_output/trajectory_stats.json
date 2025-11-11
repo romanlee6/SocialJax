@@ -1,0 +1,40 @@
+{
+  "metadata": {
+    "model": "gpt-5-mini",
+    "temperature": 0.7,
+    "seed": 42,
+    "num_agents": 2,
+    "timestamp": "2025-11-10T22:05:26"
+  },
+  "total_timesteps": 20,
+  "episode_length": 20,
+  "agents": [
+    {
+      "agent_id": 0,
+      "total_reward": 4.0,
+      "average_return": 0.2,
+      "action_distribution": {
+        "up": 8,
+        "stay": 5,
+        "left": 3,
+        "right": 4
+      },
+      "num_communications": 20,
+      "avg_belief_length": 107.65
+    },
+    {
+      "agent_id": 1,
+      "total_reward": 8.0,
+      "average_return": 0.4,
+      "action_distribution": {
+        "left": 5,
+        "stay": 4,
+        "right": 3,
+        "up": 3,
+        "down": 5
+      },
+      "num_communications": 20,
+      "avg_belief_length": 103.55
+    }
+  ]
+}

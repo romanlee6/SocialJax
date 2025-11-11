@@ -16,6 +16,8 @@ Key Components:
      a) Replacing agent k's communication with each prototype message
      b) Running other agents' forward pass with the counterfactual communication
      c) Recording their resulting actions or belief states
+   - PARAMETER SHARING MODE: Uses shared policy to predict all agents' responses
+   - NON-PARAMETER SHARING MODE: Uses each agent's actual policy for predictions
 
 2. Marginalization (marginalize_over_own_comm):
    - Compute expected influence by marginalizing over agent k's communication policy:
@@ -27,17 +29,26 @@ Key Components:
      * Marginalized counterfactual predictions (what others would do on average)
      * Actual predictions (what others actually do)
    - Higher difference = higher influence = agent's communication matters more
-   - Uses cosine similarity: influence = 1 - similarity
+   - BELIEF TARGET: Uses cosine similarity (influence = 1 - similarity)
+   - ACTION TARGET: Uses KL divergence (higher KL = more influence)
+
+4. Separate Reward Training:
+   - Action policy is trained using external task rewards
+   - Communication policy is trained using intrinsic social influence rewards
+   - Value function is trained on combined total reward
+   - This allows specialization: actions optimize task performance, comm optimizes influence
 
 Configuration Options:
 - SOCIAL_INFLUENCE_COEFF: Weight for intrinsic reward (0.0 = disabled)
 - INFLUENCE_TARGET: What to measure influence on
   * "belief": Measure impact on other agents' belief states (GRU output, not hidden state)
-  * "action": Measure impact on other agents' action distributions
+  * "action": Measure impact on other agents' action distributions (uses KL divergence)
+- USE_SEPARATE_REWARDS: Whether to use separate rewards for action and comm policies (default: True)
+- COMM_LOSS_COEF: Weight for communication policy loss (default: 0.1)
 
 Implementation Notes:
 - Parameter Sharing: Uses agent's own policy to predict others (homogeneous assumption)
-- Decentralized: Requires opponent modeling (placeholder for future implementation)
+- Non-Parameter Sharing: Directly accesses other agents' policies for counterfactual reasoning
 - JAX-compatible: All operations use JAX for automatic differentiation and JIT compilation
 
 Based on Theory of Mind (ToM) and counterfactual reasoning from:
@@ -267,6 +278,8 @@ class TransitionComm(NamedTuple):
     action: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
+    action_reward: jnp.ndarray  # External task reward for action policy
+    comm_reward: jnp.ndarray    # Intrinsic social influence reward for comm policy
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     comm_vector: jnp.ndarray
@@ -380,12 +393,16 @@ def aggregate_communication(comm_vectors, num_agents, comm_mode='avg'):
 
 
 def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden_batch, 
-                            proto_embeddings, num_agents, num_protos, comm_dim, config, rng):
+                            proto_embeddings, num_agents, num_protos, comm_dim, config, rng,
+                            parameter_sharing=True):
     """
     Generate counterfactual predictions for what other agents would do/believe
     under each possible communication from the current agent.
     
     This implements counterfactual reasoning: "If I send message m, how would others respond?"
+    
+    For parameter sharing: Uses the shared policy to predict all agents' responses.
+    For non-parameter sharing: Uses each agent's actual policy to predict their response.
     
     Dimension flow:
     1. Input: (num_envs * num_agents, ...) 
@@ -396,17 +413,18 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
     6. Averaged: (num_agents, num_protos, num_agents, output_dim)
     
     Args:
-        network: The ActorCriticComm network
-        params: Network parameters
+        network: The ActorCriticComm network (or list of networks if not parameter sharing)
+        params: Network parameters (or list of params if not parameter sharing)
         obs_batch: Observations (num_envs * num_agents, ...)
         prev_comm_batch: Previous communications (num_envs * num_agents, comm_dim)
         hidden_batch: Hidden states (num_envs * num_agents, hidden_dim)
-        proto_embeddings: Prototype embeddings (num_protos, comm_dim)
+        proto_embeddings: Prototype embeddings (num_protos, comm_dim) or list of embeddings
         num_agents: Number of agents
         num_protos: Number of prototype messages
         comm_dim: Communication dimension
         config: Configuration dict
         rng: Random key
+        parameter_sharing: Whether using parameter sharing
         
     Returns:
         counterfactuals: (num_agents, num_protos, num_agents, output_dim)
@@ -446,11 +464,24 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
     env_indices = jnp.tile(jnp.arange(num_envs), num_agents * num_protos)
     
     # Replace with prototype embeddings
-    batch_indices = jnp.arange(batch_size) // (num_envs * num_agents)
-    comm_counterfactual = comm_counterfactual.at[
-        jnp.arange(num_agents * num_protos * num_envs), 
-        agent_indices
-    ].set(proto_embeddings[proto_indices])
+    if parameter_sharing:
+        # Single set of prototypes
+        comm_counterfactual = comm_counterfactual.at[
+            jnp.arange(num_agents * num_protos * num_envs), 
+            agent_indices
+        ].set(proto_embeddings[proto_indices])
+    else:
+        # Each agent has their own prototypes
+        # Use vectorized indexing instead of Python loop
+        # Stack all prototypes: (num_agents, num_protos, comm_dim) -> index by [agent_idx, proto_idx]
+        proto_stack = jnp.stack(proto_embeddings, axis=0)  # (num_agents, num_protos, comm_dim)
+        # Get the appropriate prototypes for each scenario
+        selected_protos = proto_stack[agent_indices, proto_indices]  # (num_agents*num_protos*num_envs, comm_dim)
+        # Set them in the counterfactual communications
+        comm_counterfactual = comm_counterfactual.at[
+            jnp.arange(num_agents * num_protos * num_envs),
+            agent_indices
+        ].set(selected_protos)
     
     # Aggregate counterfactual communications
     comm_counterfactual_reshaped = comm_counterfactual.reshape(
@@ -468,16 +499,65 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
     
     # Forward pass through network to get counterfactual predictions
     rng_split = jax.random.split(rng, batch_size)
-    action_logits_cf, _, _, _, hidden_cf, belief_cf = jax.vmap(
-        lambda obs, comm, hid, r: network.apply(
-            params,
-            jnp.expand_dims(obs, 0),
-            jnp.expand_dims(comm, 0),
-            jnp.expand_dims(hid, 0),
-            train_mode=False,
-            rngs={'gumbel': r}
-        )
-    )(obs_repeated, aggregated_comm_flat, hidden_repeated, rng_split)
+    
+    if parameter_sharing:
+        # Use shared policy for all agents
+        action_logits_cf, _, _, _, hidden_cf, belief_cf = jax.vmap(
+            lambda obs, comm, hid, r: network.apply(
+                params,
+                jnp.expand_dims(obs, 0),
+                jnp.expand_dims(comm, 0),
+                jnp.expand_dims(hid, 0),
+                train_mode=False,
+                rngs={'gumbel': r}
+            )
+        )(obs_repeated, aggregated_comm_flat, hidden_repeated, rng_split)
+    else:
+        # Use each agent's own policy for predictions
+        # Process each receiving agent's predictions separately to avoid dynamic indexing
+        # batch structure: (sending_agent * num_protos * num_envs * receiving_agent)
+        
+        all_action_logits = []
+        all_hidden = []
+        all_belief = []
+        
+        for agent_idx in range(num_agents):
+            # Get indices for this receiving agent
+            # For each (sending_agent, proto, env) combination, get the prediction for this receiving agent
+            agent_indices = jnp.arange(agent_idx, batch_size, num_agents)
+            
+            # Get data for this agent
+            obs_agent = obs_repeated[agent_indices]
+            comm_agent = aggregated_comm_flat[agent_indices]
+            hidden_agent = hidden_repeated[agent_indices]
+            rng_agent = rng_split[agent_indices]
+            
+            # Apply this agent's policy
+            action_logits_i, _, _, _, hidden_i, belief_i = jax.vmap(
+                lambda obs, comm, hid, r: network[agent_idx].apply(
+                    params[agent_idx],
+                    jnp.expand_dims(obs, 0),
+                    jnp.expand_dims(comm, 0),
+                    jnp.expand_dims(hid, 0),
+                    train_mode=False,
+                    rngs={'gumbel': r}
+                )
+            )(obs_agent, comm_agent, hidden_agent, rng_agent)
+            
+            all_action_logits.append(action_logits_i)
+            all_hidden.append(hidden_i)
+            all_belief.append(belief_i)
+        
+        # Interleave results to match the batch structure
+        # Stack and reshape to get back to (batch_size, ...) order
+        action_logits_cf = jnp.stack(all_action_logits, axis=1)  # (batch_size//num_agents, num_agents, ...)
+        action_logits_cf = action_logits_cf.reshape(batch_size, -1)
+        
+        hidden_cf = jnp.stack(all_hidden, axis=1)
+        hidden_cf = hidden_cf.reshape(batch_size, -1)
+        
+        belief_cf = jnp.stack(all_belief, axis=1)
+        belief_cf = belief_cf.reshape(batch_size, -1)
     
     # Reshape to (num_agents, num_protos, num_envs, num_agents, ...)
     action_logits_cf = action_logits_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
@@ -525,12 +605,33 @@ def marginalize_over_own_comm(comm_probs, counterfactuals, epsilon=1e-8):
     return marginal
 
 
+def compute_kl_divergence(p, q, epsilon=1e-8):
+    """
+    Compute KL divergence KL(p || q) for probability distributions.
+    
+    Args:
+        p: probability distribution (should sum to 1)
+        q: probability distribution (should sum to 1)
+        epsilon: small constant for numerical stability
+        
+    Returns:
+        kl_div: scalar KL divergence value
+    """
+    # Clamp probabilities to avoid log(0)
+    p = jnp.clip(p, epsilon, 1.0)
+    q = jnp.clip(q, epsilon, 1.0)
+    return jnp.sum(p * jnp.log(p / q))
+
+
 def compute_social_influence_reward(belief_states, comm_logits, counterfactuals, 
                                     actual_outputs, config):
     """
     Compute social influence intrinsic reward.
     
     Measures how much an agent's communication changes other agents' behaviors/beliefs.
+    Uses different similarity measures based on influence target:
+    - For belief: cosine similarity
+    - For action: KL divergence (since they are probability distributions)
     
     Args:
         belief_states: (num_envs * num_agents, hidden_dim) - current belief states
@@ -543,6 +644,7 @@ def compute_social_influence_reward(belief_states, comm_logits, counterfactuals,
         influence_reward: (num_agents,) - influence reward for each agent
     """
     num_agents = counterfactuals.shape[0]
+    influence_target = config.get("INFLUENCE_TARGET", "belief")
     
     # Get communication probabilities
     comm_probs = jax.nn.softmax(comm_logits, axis=-1)
@@ -560,17 +662,30 @@ def compute_social_influence_reward(belief_states, comm_logits, counterfactuals,
         (num_agents, 1, 1)
     )  # (num_agents, num_agents, output_dim)
     
-    # Compute influence as difference between marginal and actual
-    # Using cosine similarity (1 - similarity = influence)
-    # Higher influence means communication changes others' behaviors more
-    sim = jax.vmap(
-        lambda pred, actual: jax.vmap(
-            lambda p, a: jnp.dot(p, a) / (jnp.linalg.norm(p) * jnp.linalg.norm(a) + 1e-8)
-        )(pred, actual)
-    )(marginal_predictions, actual_expanded)
-    
-    # 1 - similarity gives influence
-    influence = 1.0 - sim
+    # Compute influence based on target type
+    if influence_target == "action":
+        # For action distributions, use KL divergence
+        # Convert logits to probabilities if needed
+        marginal_probs = jax.nn.softmax(marginal_predictions, axis=-1)
+        actual_probs = jax.nn.softmax(actual_expanded, axis=-1)
+        
+        # Compute KL divergence: KL(actual || marginal)
+        # Higher KL = more influence (communication changes the distribution more)
+        influence = jax.vmap(
+            lambda pred, actual: jax.vmap(
+                lambda p, a: compute_kl_divergence(a, p)
+            )(pred, actual)
+        )(marginal_probs, actual_probs)
+    else:
+        # For belief states, use cosine similarity
+        # 1 - similarity gives influence
+        sim = jax.vmap(
+            lambda pred, actual: jax.vmap(
+                lambda p, a: jnp.dot(p, a) / (jnp.linalg.norm(p) * jnp.linalg.norm(a) + 1e-8)
+            )(pred, actual)
+        )(marginal_predictions, actual_expanded)
+        
+        influence = 1.0 - sim
     
     # Mask out self-influence (diagonal)
     mask = ~jnp.eye(num_agents, dtype=bool)
@@ -732,10 +847,13 @@ def make_train_comm(config):
                     comm_vectors_list = []
                     comm_log_probs_list = []
                     new_hidden_list = []
+                    action_logits_list = []
+                    belief_batch_list = []
+                    comm_logits_list = []
                     
                     for i in range(env.num_agents):
                         # Forward pass for agent i
-                        action_logits_i, comm_vectors_i, comm_logits_i, values_i, new_hidden_i, _ = network[i].apply(
+                        action_logits_i, comm_vectors_i, comm_logits_i, values_i, new_hidden_i, belief_i = network[i].apply(
                             train_state[i].params,
                             obs_batch[i],
                             prev_comm[:, i],
@@ -757,6 +875,11 @@ def make_train_comm(config):
                         comm_pi_i = distrax.Categorical(logits=comm_logits_i)
                         comm_log_probs_list.append(comm_pi_i.entropy())
                         new_hidden_list.append(new_hidden_i)
+                        
+                        # Store for counterfactual computation
+                        action_logits_list.append(action_logits_i)
+                        belief_batch_list.append(belief_i)
+                        comm_logits_list.append(comm_logits_i)
                     
                     # Stack results
                     actions_reshaped = jnp.stack([env_act[env.agents[i]] for i in range(env.num_agents)], axis=1)
@@ -769,6 +892,13 @@ def make_train_comm(config):
                     values = jnp.concatenate(values, axis=0)
                     comm_vectors = comm_vectors_reshaped.reshape(-1, config.get("COMM_DIM", 64))
                     comm_log_probs = jnp.concatenate(comm_log_probs_list, axis=0)
+                    
+                    # Stack for use in counterfactual computation
+                    action_logits_reshaped = action_logits_list  # List for easier indexing
+                    # For belief and comm logits, convert to list format as well
+                    
+                    # Create prev_comm_batch for counterfactual computation
+                    prev_comm_batch = prev_comm.reshape(-1, config.get("COMM_DIM", 64))
                 
                 # Aggregate communication for next step
                 aggregated_comm = aggregate_communication(
@@ -801,7 +931,8 @@ def make_train_comm(config):
                             num_protos=config.get("NUM_PROTOS", 10),
                             comm_dim=config.get("COMM_DIM", 64),
                             config=config,
-                            rng=_rng_cf
+                            rng=_rng_cf,
+                            parameter_sharing=True
                         )
                         
                         # Determine what to measure influence on
@@ -830,21 +961,70 @@ def make_train_comm(config):
                         influence_reward_batch = influence_reward_expanded
                     else:
                         # DECENTRALIZED CASE (NON-PARAMETER SHARING):
-                        # TODO: Implementation for decentralized agents
-                        # In this case, agents have separate policies and we would need to:
-                        # 1. Maintain models of other agents' policies (opponent modeling)
-                        # 2. Use these models to compute counterfactual predictions
-                        # 3. Alternatively, use learned world models or approximate methods
-                        # 
-                        # Placeholder: For now, set influence reward to zero
-                        # Future work: Implement opponent modeling or other approximation methods
-                        influence_reward_batch = jnp.zeros((config["NUM_ACTORS"],))
+                        # Each agent uses other agents' actual policies for counterfactual reasoning
                         
-                        # NOTE: Possible approaches for decentralized influence:
-                        # - Learn separate opponent models for each other agent
-                        # - Use population-based training with saved checkpoints
-                        # - Approximate using recent interaction history
-                        # - Use meta-learning to predict other agents' responses
+                        # Extract prototype embeddings from each agent's network parameters
+                        proto_embeddings = [train_state[i].params['params']['ProtoLayer_0']['prototypes'] 
+                                          for i in range(env.num_agents)]
+                        
+                        # Prepare observations, communications, and hidden states
+                        obs_reshaped = obs_batch.reshape(config["NUM_ENVS"], env.num_agents, *obs_batch.shape[1:])
+                        prev_comm_reshaped = prev_comm_batch.reshape(config["NUM_ENVS"], env.num_agents, -1)
+                        hidden_reshaped = hidden_batch.reshape(config["NUM_ENVS"], env.num_agents, -1)
+                        
+                        # Flatten back for counterfactual generation
+                        obs_flat = obs_reshaped.reshape(-1, *obs_batch.shape[1:])
+                        prev_comm_flat = prev_comm_reshaped.reshape(-1, config.get("COMM_DIM", 64))
+                        hidden_flat = hidden_reshaped.reshape(-1, hidden_reshaped.shape[-1])
+                        
+                        # Generate counterfactuals using each agent's own policy
+                        rng, _rng_cf = jax.random.split(rng)
+                        counterfactuals = generate_counterfactuals(
+                            network=network,  # List of networks
+                            params=[train_state[i].params for i in range(env.num_agents)],
+                            obs_batch=obs_flat,
+                            prev_comm_batch=prev_comm_flat,
+                            hidden_batch=hidden_flat,
+                            proto_embeddings=proto_embeddings,
+                            num_agents=env.num_agents,
+                            num_protos=config.get("NUM_PROTOS", 10),
+                            comm_dim=config.get("COMM_DIM", 64),
+                            config=config,
+                            rng=_rng_cf,
+                            parameter_sharing=False
+                        )
+                        
+                        # Determine what to measure influence on
+                        # Need to get actual outputs from each agent
+                        if config.get("INFLUENCE_TARGET", "belief") == "action":
+                            # Stack action logits from all agents
+                            actual_outputs = jnp.stack([action_logits_reshaped[i] for i in range(env.num_agents)], axis=0)
+                            actual_outputs = actual_outputs.reshape(-1, actual_outputs.shape[-1])
+                        else:
+                            # Stack belief states from all agents
+                            actual_outputs = jnp.stack([belief_batch_list[i] for i in range(env.num_agents)], axis=0)
+                            actual_outputs = actual_outputs.reshape(-1, actual_outputs.shape[-1])
+                        
+                        # Stack comm logits from all agents
+                        comm_logits_stacked = jnp.stack([comm_logits_list[i] for i in range(env.num_agents)], axis=0)
+                        comm_logits_stacked = comm_logits_stacked.reshape(-1, comm_logits_stacked.shape[-1])
+                        
+                        # Compute influence reward
+                        influence_reward = compute_social_influence_reward(
+                            belief_states=hidden_flat,
+                            comm_logits=comm_logits_stacked,
+                            counterfactuals=counterfactuals,
+                            actual_outputs=actual_outputs,
+                            config=config
+                        )
+                        
+                        # Expand influence reward to match batch size
+                        influence_reward_expanded = jnp.tile(
+                            influence_reward, 
+                            config["NUM_ENVS"]
+                        ).reshape(-1)
+                        
+                        influence_reward_batch = influence_reward_expanded
                 
                 # Prepare actions for environment
                 env_act = [v for v in env_act.values()]
@@ -857,23 +1037,33 @@ def make_train_comm(config):
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
                 
-                # Add social influence intrinsic reward to environment reward
-                env_reward = batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze()
-                total_reward = env_reward + config.get("SOCIAL_INFLUENCE_COEFF", 0.0) * influence_reward_batch
-                
-                # Store influence reward in info for logging
-                if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
-                    info['social_influence_reward'] = influence_reward_batch.reshape(config["NUM_ENVS"], env.num_agents)
-                    info['env_reward_only'] = env_reward.reshape(config["NUM_ENVS"], env.num_agents)
-                
                 # Store transition
                 if config.get("PARAMETER_SHARING", True):
+                    # PARAMETER SHARING: rewards are flattened (num_envs * num_agents,)
+                    env_reward = batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze()
+                    
+                    # Action policy uses external task reward only
+                    action_reward = env_reward
+                    
+                    # Communication policy uses intrinsic social influence reward
+                    comm_reward = config.get("SOCIAL_INFLUENCE_COEFF", 0.0) * influence_reward_batch
+                    
+                    # Total reward (for value function - combines both)
+                    total_reward = action_reward + comm_reward
+                    
+                    # Store influence reward in info for logging
+                    if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
+                        info['social_influence_reward'] = influence_reward_batch.reshape(config["NUM_ENVS"], env.num_agents)
+                        info['env_reward_only'] = env_reward.reshape(config["NUM_ENVS"], env.num_agents)
+                    
                     info = jax.tree_util.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                     transition = TransitionComm(
                         batchify_dict(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                         actions,
                         values,
                         total_reward,
+                        action_reward,
+                        comm_reward,
                         log_probs,
                         obs_batch,
                         comm_vectors,
@@ -882,15 +1072,30 @@ def make_train_comm(config):
                         info,
                     )
                 else:
+                    # NON-PARAMETER SHARING: rewards are per-agent (num_envs,) for each agent
+                    # Store influence reward in info for logging
+                    if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
+                        info['social_influence_reward'] = influence_reward_batch.reshape(config["NUM_ENVS"], env.num_agents)
+                        info['env_reward_only'] = reward  # Already has shape (num_envs, num_agents)
+                    
                     transition = []
                     done_list = [v for v in done.values()]
                     for i in range(env.num_agents):
                         info_i = {key: jax.tree_util.tree_map(lambda x: x.reshape((config["NUM_ACTORS"]), 1), value[:, i]) for key, value in info.items()}
+                        
+                        # Get rewards for this agent
+                        agent_env_reward = reward[:, i]
+                        agent_action_reward = agent_env_reward
+                        agent_comm_reward = influence_reward_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]] * config.get("SOCIAL_INFLUENCE_COEFF", 0.0)
+                        agent_total_reward = agent_action_reward + agent_comm_reward
+                        
                         transition.append(TransitionComm(
                             done_list[i],
                             env_act[i],
                             values[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
-                            reward[:, i],
+                            agent_total_reward,
+                            agent_action_reward,
+                            agent_comm_reward,
                             log_probs[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             obs_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             comm_vectors[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
@@ -961,24 +1166,114 @@ def make_train_comm(config):
                 )
                 return advantages, advantages + traj_batch.value
             
+            def _calculate_separate_advantages(traj_batch, last_val):
+                """Calculate separate advantages for action and communication policies"""
+                # Advantages for action policy (using action_reward)
+                def _get_action_advantages(gae_and_next_value, transition):
+                    gae, next_value = gae_and_next_value
+                    done, value, action_reward = (
+                        transition.done,
+                        transition.value,
+                        transition.action_reward,
+                    )
+                    delta = action_reward + config["GAMMA"] * next_value * (1 - done) - value
+                    gae = (
+                        delta
+                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    )
+                    return (gae, value), gae
+                
+                _, action_advantages = jax.lax.scan(
+                    _get_action_advantages,
+                    (jnp.zeros_like(last_val), last_val),
+                    traj_batch,
+                    reverse=True,
+                    unroll=16,
+                )
+                
+                # Advantages for communication policy (using comm_reward)
+                def _get_comm_advantages(gae_and_next_value, transition):
+                    gae, next_value = gae_and_next_value
+                    done, value, comm_reward = (
+                        transition.done,
+                        transition.value,
+                        transition.comm_reward,
+                    )
+                    delta = comm_reward + config["GAMMA"] * next_value * (1 - done) - value
+                    gae = (
+                        delta
+                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    )
+                    return (gae, value), gae
+                
+                _, comm_advantages = jax.lax.scan(
+                    _get_comm_advantages,
+                    (jnp.zeros_like(last_val), last_val),
+                    traj_batch,
+                    reverse=True,
+                    unroll=16,
+                )
+                
+                # Value target uses total reward
+                def _get_value_advantages(gae_and_next_value, transition):
+                    gae, next_value = gae_and_next_value
+                    done, value, reward = (
+                        transition.done,
+                        transition.value,
+                        transition.reward,
+                    )
+                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                    gae = (
+                        delta
+                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    )
+                    return (gae, value), gae
+                
+                _, value_advantages = jax.lax.scan(
+                    _get_value_advantages,
+                    (jnp.zeros_like(last_val), last_val),
+                    traj_batch,
+                    reverse=True,
+                    unroll=16,
+                )
+                
+                targets = value_advantages + traj_batch.value
+                return action_advantages, comm_advantages, targets
+            
+            # Use separate advantages if we want to train action and comm separately
+            use_separate_rewards = config.get("USE_SEPARATE_REWARDS", True)
+            
             if config.get("PARAMETER_SHARING", True):
-                advantages, targets = _calculate_gae(traj_batch, last_val)
+                if use_separate_rewards:
+                    action_advantages, comm_advantages, targets = _calculate_separate_advantages(traj_batch, last_val)
+                else:
+                    advantages, targets = _calculate_gae(traj_batch, last_val)
+                    action_advantages = advantages
+                    comm_advantages = advantages
             else:
-                advantages = []
+                action_advantages_list = []
+                comm_advantages_list = []
                 targets = []
                 for i in range(env.num_agents):
-                    advantages_i, targets_i = _calculate_gae(traj_batch[i], last_val[i])
-                    advantages.append(advantages_i)
+                    if use_separate_rewards:
+                        action_adv_i, comm_adv_i, targets_i = _calculate_separate_advantages(traj_batch[i], last_val[i])
+                        action_advantages_list.append(action_adv_i)
+                        comm_advantages_list.append(comm_adv_i)
+                    else:
+                        advantages_i, targets_i = _calculate_gae(traj_batch[i], last_val[i])
+                        action_advantages_list.append(advantages_i)
+                        comm_advantages_list.append(advantages_i)
                     targets.append(targets_i)
-                advantages = jnp.stack(advantages, axis=0)
+                action_advantages = jnp.stack(action_advantages_list, axis=0)
+                comm_advantages = jnp.stack(comm_advantages_list, axis=0)
                 targets = jnp.stack(targets, axis=0)
             
             # UPDATE NETWORK
             def _update_epoch(update_state, unused, i):
                 def _update_minbatch(train_state, batch_info, network_used):
-                    traj_batch, advantages, targets = batch_info
+                    traj_batch, action_adv, comm_adv, targets = batch_info
                     
-                    def _loss_fn(params, traj_batch, gae, targets, network_used, rng):
+                    def _loss_fn(params, traj_batch, action_gae, comm_gae, targets, network_used, rng):
                         # RERUN NETWORK
                         # Reconstruct prev_comm from aggregated communications
                         batch_size = traj_batch.obs.shape[0]
@@ -991,7 +1286,7 @@ def make_train_comm(config):
                         aggregated = aggregate_communication(comm_reshaped, env.num_agents, config.get("COMM_MODE", "avg"))
                         prev_comm_recon = aggregated.reshape(batch_size, comm_dim)
                         
-                        action_logits, _, _, values, _, _ = network_used.apply(
+                        action_logits, _, comm_logits, values, _, _ = network_used.apply(
                             params,
                             traj_batch.obs,
                             prev_comm_recon,
@@ -1000,8 +1295,14 @@ def make_train_comm(config):
                             rngs={'gumbel': rng}
                         )
                         
+                        # Action policy
                         pi = distrax.Categorical(logits=action_logits)
                         log_prob = pi.log_prob(traj_batch.action)
+                        
+                        # Communication policy
+                        comm_pi = distrax.Categorical(logits=comm_logits)
+                        # Get the actual selected comm (from stored comm_log_prob, we can't directly get it)
+                        # We'll use the entropy-based loss for comm policy
                         
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -1013,45 +1314,58 @@ def make_train_comm(config):
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
                         
-                        # CALCULATE ACTOR LOSS
+                        # CALCULATE ACTION POLICY LOSS (using action_gae based on external rewards)
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
+                        action_gae_normalized = (action_gae - action_gae.mean()) / (action_gae.std() + 1e-8)
+                        loss_actor1 = ratio * action_gae_normalized
                         loss_actor2 = (
                             jnp.clip(
                                 ratio,
                                 1.0 - config["CLIP_EPS"],
                                 1.0 + config["CLIP_EPS"],
                             )
-                            * gae
+                            * action_gae_normalized
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
                         
+                        # CALCULATE COMMUNICATION POLICY LOSS (using comm_gae based on intrinsic rewards)
+                        # For communication, we use a policy gradient approach based on the comm advantages
+                        # Since comm uses Gumbel-Softmax, we optimize the logits directly
+                        comm_gae_normalized = (comm_gae - comm_gae.mean()) / (comm_gae.std() + 1e-8)
+                        # We can't easily compute the ratio for comm policy since it uses Gumbel-Softmax
+                        # So we use a simple policy gradient: maximize log_prob * advantage
+                        # Use the stored comm_log_prob (which is actually entropy in the current implementation)
+                        # For now, we'll use entropy bonus to encourage exploration in comm
+                        comm_entropy = comm_pi.entropy().mean()
+                        # Loss for comm: negative advantage-weighted entropy (encourages high-reward comms)
+                        loss_comm = -comm_gae_normalized.mean() * comm_entropy
+                        
                         total_loss = (
                             loss_actor
+                            + config.get("COMM_LOSS_COEF", 0.1) * loss_comm  # Separate coefficient for comm loss
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
-                        return total_loss, (value_loss, loss_actor, entropy)
+                        return total_loss, (value_loss, loss_actor, loss_comm, entropy, comm_entropy)
                     
                     rng, _rng = jax.random.split(update_state[-1])
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
-                        train_state.params, traj_batch, advantages, targets, network_used, _rng
+                        train_state.params, traj_batch, action_adv, comm_adv, targets, network_used, _rng
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
                 
-                train_state, traj_batch, advantages, targets, rng = update_state
+                train_state, traj_batch, action_adv, comm_adv, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
                 batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
                 assert (
                     batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
                 ), "batch size must be equal to number of steps * number of actors"
                 permutation = jax.random.permutation(_rng, batch_size)
-                batch = (traj_batch, advantages, targets)
+                batch = (traj_batch, action_adv, comm_adv, targets)
                 batch = jax.tree_util.tree_map(
                     lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
                 )
@@ -1074,11 +1388,11 @@ def make_train_comm(config):
                         lambda state, batch_info: _update_minbatch(state, batch_info, network[i]), train_state, minibatches
                     )
                 
-                update_state = (train_state, traj_batch, advantages, targets, rng)
+                update_state = (train_state, traj_batch, action_adv, comm_adv, targets, rng)
                 return update_state, total_loss
             
             if config.get("PARAMETER_SHARING", True):
-                update_state = (train_state, traj_batch, advantages, targets, rng)
+                update_state = (train_state, traj_batch, action_advantages, comm_advantages, targets, rng)
                 update_state, loss_info = jax.lax.scan(
                     lambda state, unused: _update_epoch(state, unused, 0), update_state, None, config["UPDATE_EPOCHS"]
                 )
@@ -1089,7 +1403,7 @@ def make_train_comm(config):
                 update_state_dict = []
                 metric = []
                 for i in range(env.num_agents):
-                    update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], rng)
+                    update_state = (train_state[i], traj_batch[i], action_advantages[i], comm_advantages[i], targets[i], rng)
                     update_state, loss_info = jax.lax.scan(
                         lambda state, unused: _update_epoch(state, unused, i), update_state, None, config["UPDATE_EPOCHS"]
                     )
@@ -1101,7 +1415,21 @@ def make_train_comm(config):
                     rng = update_state[-1]
             
             def callback(metric):
-                wandb.log(metric)
+                # Convert all JAX arrays to Python scalars for wandb
+                metric_python = {}
+                for key, value in metric.items():
+                    try:
+                        # Convert JAX arrays to Python scalars
+                        if hasattr(value, 'item'):
+                            metric_python[key] = value.item()
+                        elif isinstance(value, (jnp.ndarray, np.ndarray)):
+                            metric_python[key] = float(value)
+                        else:
+                            metric_python[key] = value
+                    except (ValueError, TypeError):
+                        # Skip if conversion fails
+                        continue
+                wandb.log(metric_python)
             
             update_step = update_step + 1
             metric = jax.tree_util.tree_map(lambda x: x.mean(), metric)
@@ -1122,12 +1450,12 @@ def make_train_comm(config):
                 try:
                     if "social_influence_reward" in metric:
                         # Convert to Python scalar for WandB
-                        metric["intrinsic_reward/social_influence"] = float(metric["social_influence_reward"])
+                        metric["intrinsic_reward/social_influence"] = metric["social_influence_reward"]
                     if "env_reward_only" in metric:
                         # Convert to Python scalar for WandB
-                        metric["extrinsic_reward/environment"] = float(metric["env_reward_only"])
+                        metric["extrinsic_reward/environment"] = metric["env_reward_only"]
                     # Log the coefficient for reference
-                    metric["intrinsic_reward/influence_coeff"] = float(config.get("SOCIAL_INFLUENCE_COEFF", 0.0))
+                    metric["intrinsic_reward/influence_coeff"] = config.get("SOCIAL_INFLUENCE_COEFF", 0.0)
                     metric["intrinsic_reward/influence_target"] = 1.0 if config.get("INFLUENCE_TARGET", "belief") == "belief" else 0.0
                 except (KeyError, TypeError) as e:
                     # If metrics don't exist yet or can't be converted, skip logging them
@@ -1475,7 +1803,21 @@ def make_train(config):
                     rng = update_state[-1]
                 
             def callback(metric):
-                wandb.log(metric)
+                # Convert all JAX arrays to Python scalars for wandb
+                metric_python = {}
+                for key, value in metric.items():
+                    try:
+                        # Convert JAX arrays to Python scalars
+                        if hasattr(value, 'item'):
+                            metric_python[key] = value.item()
+                        elif isinstance(value, (jnp.ndarray, np.ndarray)):
+                            metric_python[key] = float(value)
+                        else:
+                            metric_python[key] = value
+                    except (ValueError, TypeError):
+                        # Skip if conversion fails
+                        continue
+                wandb.log(metric_python)
 
             update_step = update_step + 1
             metric = jax.tree_util.tree_map(lambda x: x.mean(), metric)
@@ -1819,43 +2161,49 @@ def tune(default_config):
     """
     Hyperparameter sweep with wandb for social influence experiments.
     
-    Experiments:
-    - Reward structure: Individual only
-    - Influence target: Belief vs Action states  
-    - Social influence coefficient: 0.01 vs 0.1
-    - Seeds: 3 different random seeds
+    Experiments (NON-PARAMETER-SHARING ONLY):
+    - Parameter sharing: False (individual policies with direct policy access)
+    - Separate rewards: True vs False (separate action/comm training vs combined)
+    - Influence target: Belief vs Action states (cosine sim vs KL divergence)
+    - Seed: 42 (fixed)
+    - Social influence coefficient: 0.1 (fixed)
     
-    Current sweep: Influence Target × Coefficient × Seeds
-    Total runs: 2 × 2 × 3 = 12 experiments
+    Current sweep: Separate Rewards × Influence Target
+    Total runs: 2 × 2 = 4 experiments
     
-    Each experiment trains with communication and parameter sharing.
+    All experiments train with communication enabled and WITHOUT parameter sharing.
     """
     import copy
 
     default_config = OmegaConf.to_container(default_config)
 
     sweep_config = {
-        "name": "lgtom_social_influence_sweep",
+        "name": "lgtom_non_ps_architecture_sweep",
         "method": "grid",  # Try all combinations
+        "program": "lgtom_cnn_coins.py",  # The script to run
         "metric": {
             "name": "returned_episode_returns",
             "goal": "maximize",
         },
         "parameters": {
-            # Main sweep parameters for social influence experiments
-            "PARAMETER_SHARING": {"values": [True]},  # Required for social influence
-            "ENV_KWARGS.shared_rewards": {"values": [False]},  # Only individual rewards
-            "INFLUENCE_TARGET": {"values": ["belief", "action"]},  # What to measure influence on
-            "SOCIAL_INFLUENCE_COEFF": {"values": [0.01, 0.1]},  # Two coefficient values
-            "SEED": {"values": [42, 52, 62]},  # Three different seeds
+            # Main sweep parameters for non-parameter-sharing ablation
+            "PARAMETER_SHARING": {"values": [False]},  # Only non-parameter-sharing
+            "USE_SEPARATE_REWARDS": {"values": [True, False]},  # Separate vs combined training
+            "INFLUENCE_TARGET": {"values": ["belief", "action"]},  # Cosine sim vs KL div
+            "SOCIAL_INFLUENCE_COEFF": {"values": [0.1]},  # Fixed coefficient
+            "SEED": {"values": [42]},  # Fixed seed
             
-            # Total runs: 1 × 1 × 2 × 2 × 3 = 12 experiments
+            # Fixed settings
+            "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
+            "USE_COMM": {"values": [True]},  # Always use communication
+            
+            # Total runs: 1 × 2 × 2 × 1 × 1 = 4 experiments
             # 
-            # Experiment matrix:
-            # - Reward structure: individual only
-            # - Influence target: belief vs action
-            # - Influence coefficient: 0.01 vs 0.1
-            # - Seeds: 42, 52, 62
+            # Experiment matrix (non-parameter-sharing only):
+            # - Separate rewards: action/comm separated vs combined
+            # - Influence target: belief (cosine) vs action (KL div)
+            # - Coefficient: 0.1 (all)
+            # - Seed: 42 (all)
         },
     }
 
@@ -1874,47 +2222,43 @@ def tune(default_config):
             else:
                 config[k] = v
         
+        # Ensure USE_COMM is always True for this sweep
+        config["USE_COMM"] = True
+        
         # Build descriptive run name
-        param_sharing_str = "ps" if config.get("PARAMETER_SHARING", True) else "ind"
-        reward_str = "shared" if config["ENV_KWARGS"].get("shared_rewards", False) else "individual"
-        use_comm = config.get("USE_COMM", False)
-        
-        # Social influence parameters
-        influence_coeff = config.get("SOCIAL_INFLUENCE_COEFF", 0.0)
+        separate_rewards_str = "sep" if config.get("USE_SEPARATE_REWARDS", True) else "joint"
         influence_target = config.get("INFLUENCE_TARGET", "belief")
+        influence_coeff = config.get("SOCIAL_INFLUENCE_COEFF", 0.1)
         
-        # Build run name with all key parameters
-        if influence_coeff > 0:
-            influence_str = f"si{influence_coeff}_{influence_target}"
-        else:
-            influence_str = "no_si"
-        
-        run_name = f"lgtom_{param_sharing_str}_{reward_str}_{influence_str}_s{config['SEED']}"
+        # Build run name - note these are all non-parameter-sharing runs
+        run_name = f"lgtom_ind_{separate_rewards_str}_{influence_target}_coef{influence_coeff}_s{config['SEED']}"
         wandb.run.name = run_name
         
         # Update tags based on configuration
-        tags = ["LGTOM", "COMM", "PS"]  # Always communication with parameter sharing
+        tags = ["LGTOM", "COMM", "IND"]  # All runs are individual (non-PS)
         
-        if config["ENV_KWARGS"].get("shared_rewards", False):
-            tags.append("SHARED_REWARD")
+        # Separate rewards tag
+        if config.get("USE_SEPARATE_REWARDS", True):
+            tags.append("SEPARATE_REWARDS")
         else:
-            tags.append("INDIVIDUAL_REWARD")
+            tags.append("JOINT_REWARDS")
         
-        if influence_coeff > 0:
-            tags.append("SOCIAL_INFLUENCE")
-            tags.append(f"INFLUENCE_{influence_target.upper()}")
-        else:
-            tags.append("NO_INFLUENCE")
+        # Influence target tag
+        tags.append(f"INFLUENCE_{influence_target.upper()}")
+        
+        # Social influence enabled
+        tags.append("SOCIAL_INFLUENCE")
+        tags.append(f"COEF_{influence_coeff}")
         
         wandb.run.tags = tags
         
         print("="*70)
         print(f"Running experiment: {run_name}")
         print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', True)}")
-        print(f"  Reward Type: {reward_str}")
-        print(f"  Social Influence Coeff: {influence_coeff}")
-        print(f"  Influence Target: {influence_target}")
-        print(f"  Seed: {config['SEED']}")
+        print(f"  USE_SEPARATE_REWARDS: {config.get('USE_SEPARATE_REWARDS', True)}")
+        print(f"  INFLUENCE_TARGET: {influence_target}")
+        print(f"  SOCIAL_INFLUENCE_COEFF: {influence_coeff}")
+        print(f"  SEED: {config['SEED']}")
         print(f"  Total Timesteps: {config['TOTAL_TIMESTEPS']:.0e}")
         print(f"  Tags: {tags}")
         print("="*70)
@@ -1923,11 +2267,8 @@ def tune(default_config):
         rng = jax.random.PRNGKey(config["SEED"])
         rngs = jax.random.split(rng, config["NUM_SEEDS"])
         
-        # Select appropriate training function
-        if use_comm:
-            train_fn = make_train_comm(config)
-        else:
-            train_fn = make_train(config)
+        # Select appropriate training function (always use communication in this sweep)
+        train_fn = make_train_comm(config)
         
         train_vjit = jax.jit(jax.vmap(train_fn))
         outs = jax.block_until_ready(train_vjit(rngs))
@@ -1952,19 +2293,27 @@ def tune(default_config):
     )
     
     print("\n" + "="*70)
-    print("Starting WandB Sweep: Social Influence Experiments")
+    print("Starting WandB Sweep: Non-Parameter-Sharing Architecture Ablation")
     print(f"Sweep ID: {sweep_id}")
     print(f"Total Combinations:")
-    print(f"  - Reward structure: individual only")
+    print(f"  - Parameter sharing: 1 (False - individual policies)")
+    print(f"  - Separate rewards: 2 (True, False)")
     print(f"  - Influence target: 2 (belief, action)")
-    print(f"  - Influence coefficient: 2 (0.01, 0.1)")
-    print(f"  - Seeds: 3 (42, 52, 62)")
-    print(f"  - Total: 2 × 2 × 3 = 12 runs")
+    print(f"  - Coefficient: 1 (0.1)")
+    print(f"  - Seed: 1 (42)")
+    print(f"  - Total: 1 × 2 × 2 × 1 × 1 = 4 runs")
     print(f"Timesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
+    print(f"\nExperiment Details:")
+    print(f"  All runs use communication (USE_COMM=True)")
+    print(f"  All runs use individual policies (PARAMETER_SHARING=False)")
+    print(f"  Social influence coefficient fixed at 0.1")
+    print(f"  Individual rewards (not shared)")
+    print(f"  Testing separate vs joint reward training methods")
+    print(f"  Testing belief (cosine) vs action (KL div) influence targets")
     print("="*70 + "\n")
     
-    # Run sweep agent (count=12 for all combinations)
-    wandb.agent(sweep_id, wrapped_make_train, count=12)
+    # Run sweep agent (count=4 for all combinations)
+    wandb.agent(sweep_id, wrapped_make_train, count=4)
 
 
 @hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_coins")

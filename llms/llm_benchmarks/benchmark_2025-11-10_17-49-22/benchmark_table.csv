@@ -1,0 +1,6 @@
+Model,Status,Episode_Length,Total_Time_s,Time_per_Step_s,Agent0_Total_Reward,Agent0_Avg_Reward,Agent1_Total_Reward,Agent1_Avg_Reward,Total_Input_Tokens,Total_Output_Tokens,Total_Tokens,Avg_Input_Tokens_per_Step,Avg_Output_Tokens_per_Step
+gpt-5,success,20,1176.69,58.835,4.00,0.2000,6.00,0.3000,43491,96215,139706,2174.6,4810.8
+gpt-5-mini,success,20,580.75,29.037,6.00,0.3000,4.00,0.2000,37787,41788,79575,1889.3,2089.4
+o3,success,20,365.40,18.270,0.00,0.0000,8.00,0.4000,38108,24768,62876,1905.4,1238.4
+o4-mini,success,20,312.42,15.621,10.00,0.5000,0.00,0.0000,36919,32276,69195,1846.0,1613.8
+gpt-oss-120b,success,20,35.70,1.785,0.00,0.0000,0.00,0.0000,0,0,0,0.0,0.0

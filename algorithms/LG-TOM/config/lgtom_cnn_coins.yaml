@@ -25,7 +25,7 @@
 "ANNEAL_LR": True
 "SEED": 42  # Default seed (will be overridden by sweep when TUNE=True)
 "NUM_SEEDS": 1
-"TUNE": False  # Set to True to run hyperparameter sweep (12 runs: 2×2×3)
+"TUNE": False  # Set to True to run non-PS ablation sweep (4 runs: 2×2 for SepReward×InfluenceTarget)
 
 "REWARD": "individual" # individual; common
 "GIF_NUM_FRAMES": 250
@@ -40,7 +40,9 @@
 
 # Social Influence Intrinsic Reward Parameters
 "SOCIAL_INFLUENCE_COEFF": 0.1  # Coefficient for social influence intrinsic reward
-"INFLUENCE_TARGET": "belief"  # What to measure influence on: "action" or "belief"
+"INFLUENCE_TARGET": "belief"  # What to measure influence on: "action" (KL div) or "belief" (cosine sim)
+"USE_SEPARATE_REWARDS": True  # Train action and comm heads with separate rewards
+"COMM_LOSS_COEF": 0.1  # Weight for communication policy loss
 
 # WandB Params
 "ENTITY": ""

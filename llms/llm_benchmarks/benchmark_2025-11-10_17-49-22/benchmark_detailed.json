@@ -1,0 +1,217 @@
+{
+  "timestamp": "2025-11-10_17-49-22",
+  "models": [
+    {
+      "model": "gpt-5",
+      "status": "success",
+      "seed": 42,
+      "num_steps": 20,
+      "temperature": 0.7,
+      "episode_length": 20,
+      "total_time_seconds": 1176.6911866664886,
+      "time_per_step": 58.834559333324435,
+      "total_input_tokens": 43491,
+      "total_output_tokens": 96215,
+      "total_tokens": 139706,
+      "avg_input_tokens_per_step": 2174.55,
+      "avg_output_tokens_per_step": 4810.75,
+      "agents": [
+        {
+          "agent_id": 0,
+          "total_reward": 4.0,
+          "avg_reward": 0.2,
+          "num_communications": 20
+        },
+        {
+          "agent_id": 1,
+          "total_reward": 6.0,
+          "avg_reward": 0.3,
+          "num_communications": 20
+        }
+      ],
+      "action_distributions": [
+        {
+          "up": 13,
+          "left": 3,
+          "right": 4
+        },
+        {
+          "turn_left": 1,
+          "right": 8,
+          "left": 4,
+          "down": 6,
+          "up": 1
+        }
+      ]
+    },
+    {
+      "model": "gpt-5-mini",
+      "status": "success",
+      "seed": 42,
+      "num_steps": 20,
+      "temperature": 0.7,
+      "episode_length": 20,
+      "total_time_seconds": 580.7479026317596,
+      "time_per_step": 29.03739513158798,
+      "total_input_tokens": 37787,
+      "total_output_tokens": 41788,
+      "total_tokens": 79575,
+      "avg_input_tokens_per_step": 1889.35,
+      "avg_output_tokens_per_step": 2089.4,
+      "agents": [
+        {
+          "agent_id": 0,
+          "total_reward": 6.0,
+          "avg_reward": 0.3,
+          "num_communications": 20
+        },
+        {
+          "agent_id": 1,
+          "total_reward": 4.0,
+          "avg_reward": 0.2,
+          "num_communications": 20
+        }
+      ],
+      "action_distributions": [
+        {
+          "stay": 2,
+          "down": 2,
+          "left": 7,
+          "up": 8,
+          "right": 1
+        },
+        {
+          "up": 10,
+          "right": 2,
+          "down": 4,
+          "stay": 1,
+          "left": 3
+        }
+      ]
+    },
+    {
+      "model": "o3",
+      "status": "success",
+      "seed": 42,
+      "num_steps": 20,
+      "temperature": 0.7,
+      "episode_length": 20,
+      "total_time_seconds": 365.40171670913696,
+      "time_per_step": 18.270085835456847,
+      "total_input_tokens": 38108,
+      "total_output_tokens": 24768,
+      "total_tokens": 62876,
+      "avg_input_tokens_per_step": 1905.4,
+      "avg_output_tokens_per_step": 1238.4,
+      "agents": [
+        {
+          "agent_id": 0,
+          "total_reward": 0.0,
+          "avg_reward": 0.0,
+          "num_communications": 20
+        },
+        {
+          "agent_id": 1,
+          "total_reward": 8.0,
+          "avg_reward": 0.4,
+          "num_communications": 20
+        }
+      ],
+      "action_distributions": [
+        {
+          "up": 11,
+          "left": 7,
+          "down": 1,
+          "right": 1
+        },
+        {
+          "turn_right": 1,
+          "right": 12,
+          "left": 4,
+          "down": 1,
+          "up": 2
+        }
+      ]
+    },
+    {
+      "model": "o4-mini",
+      "status": "success",
+      "seed": 42,
+      "num_steps": 20,
+      "temperature": 0.7,
+      "episode_length": 20,
+      "total_time_seconds": 312.41575717926025,
+      "time_per_step": 15.620787858963013,
+      "total_input_tokens": 36919,
+      "total_output_tokens": 32276,
+      "total_tokens": 69195,
+      "avg_input_tokens_per_step": 1845.95,
+      "avg_output_tokens_per_step": 1613.8,
+      "agents": [
+        {
+          "agent_id": 0,
+          "total_reward": 10.0,
+          "avg_reward": 0.5,
+          "num_communications": 13
+        },
+        {
+          "agent_id": 1,
+          "total_reward": 0.0,
+          "avg_reward": 0.0,
+          "num_communications": 15
+        }
+      ],
+      "action_distributions": [
+        {
+          "up": 17,
+          "left": 1,
+          "right": 2
+        },
+        {
+          "down": 5,
+          "right": 8,
+          "left": 3,
+          "up": 2,
+          "turn_left": 2
+        }
+      ]
+    },
+    {
+      "model": "gpt-oss-120b",
+      "status": "success",
+      "seed": 42,
+      "num_steps": 20,
+      "temperature": 0.7,
+      "episode_length": 20,
+      "total_time_seconds": 35.695820331573486,
+      "time_per_step": 1.7847910165786742,
+      "total_input_tokens": 0,
+      "total_output_tokens": 0,
+      "total_tokens": 0,
+      "avg_input_tokens_per_step": 0.0,
+      "avg_output_tokens_per_step": 0.0,
+      "agents": [
+        {
+          "agent_id": 0,
+          "total_reward": 0.0,
+          "avg_reward": 0.0,
+          "num_communications": 0
+        },
+        {
+          "agent_id": 1,
+          "total_reward": 0.0,
+          "avg_reward": 0.0,
+          "num_communications": 0
+        }
+      ],
+      "action_distributions": [
+        {
+          "stay": 20
+        },
+        {
+          "stay": 20
+        }
+      ]
+    }
+  ]
+}

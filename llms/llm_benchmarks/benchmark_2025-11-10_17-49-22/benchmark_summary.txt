@@ -1,0 +1,177 @@
+================================================================================
+LLM BENCHMARK SUMMARY - Coins Game
+================================================================================
+Timestamp: 2025-11-10_17-49-22
+Number of Models: 5
+================================================================================
+
+MODEL: gpt-5
+--------------------------------------------------------------------------------
+Status: success
+
+Performance:
+  Episode Length: 20 steps
+  Total Time: 1176.69 seconds
+  Time per Step: 58.835 seconds
+
+Agent Performance:
+  Agent 0:
+    Total Reward: 4.00
+    Average Reward: 0.2000
+    Communications Sent: 20
+  Agent 1:
+    Total Reward: 6.00
+    Average Reward: 0.3000
+    Communications Sent: 20
+
+Token Usage (Total):
+  Input Tokens: 43,491
+  Output Tokens: 96,215
+  Total Tokens: 139,706
+
+Token Usage (Average per Agent per Step):
+  Input Tokens: 2174.6
+  Output Tokens: 4810.8
+
+Action Distributions:
+  Agent 0: {'up': 13, 'left': 3, 'right': 4}
+  Agent 1: {'turn_left': 1, 'right': 8, 'left': 4, 'down': 6, 'up': 1}
+
+================================================================================
+
+MODEL: gpt-5-mini
+--------------------------------------------------------------------------------
+Status: success
+
+Performance:
+  Episode Length: 20 steps
+  Total Time: 580.75 seconds
+  Time per Step: 29.037 seconds
+
+Agent Performance:
+  Agent 0:
+    Total Reward: 6.00
+    Average Reward: 0.3000
+    Communications Sent: 20
+  Agent 1:
+    Total Reward: 4.00
+    Average Reward: 0.2000
+    Communications Sent: 20
+
+Token Usage (Total):
+  Input Tokens: 37,787
+  Output Tokens: 41,788
+  Total Tokens: 79,575
+
+Token Usage (Average per Agent per Step):
+  Input Tokens: 1889.3
+  Output Tokens: 2089.4
+
+Action Distributions:
+  Agent 0: {'stay': 2, 'down': 2, 'left': 7, 'up': 8, 'right': 1}
+  Agent 1: {'up': 10, 'right': 2, 'down': 4, 'stay': 1, 'left': 3}
+
+================================================================================
+
+MODEL: o3
+--------------------------------------------------------------------------------
+Status: success
+
+Performance:
+  Episode Length: 20 steps
+  Total Time: 365.40 seconds
+  Time per Step: 18.270 seconds
+
+Agent Performance:
+  Agent 0:
+    Total Reward: 0.00
+    Average Reward: 0.0000
+    Communications Sent: 20
+  Agent 1:
+    Total Reward: 8.00
+    Average Reward: 0.4000
+    Communications Sent: 20
+
+Token Usage (Total):
+  Input Tokens: 38,108
+  Output Tokens: 24,768
+  Total Tokens: 62,876
+
+Token Usage (Average per Agent per Step):
+  Input Tokens: 1905.4
+  Output Tokens: 1238.4
+
+Action Distributions:
+  Agent 0: {'up': 11, 'left': 7, 'down': 1, 'right': 1}
+  Agent 1: {'turn_right': 1, 'right': 12, 'left': 4, 'down': 1, 'up': 2}
+
+================================================================================
+
+MODEL: o4-mini
+--------------------------------------------------------------------------------
+Status: success
+
+Performance:
+  Episode Length: 20 steps
+  Total Time: 312.42 seconds
+  Time per Step: 15.621 seconds
+
+Agent Performance:
+  Agent 0:
+    Total Reward: 10.00
+    Average Reward: 0.5000
+    Communications Sent: 13
+  Agent 1:
+    Total Reward: 0.00
+    Average Reward: 0.0000
+    Communications Sent: 15
+
+Token Usage (Total):
+  Input Tokens: 36,919
+  Output Tokens: 32,276
+  Total Tokens: 69,195
+
+Token Usage (Average per Agent per Step):
+  Input Tokens: 1846.0
+  Output Tokens: 1613.8
+
+Action Distributions:
+  Agent 0: {'up': 17, 'left': 1, 'right': 2}
+  Agent 1: {'down': 5, 'right': 8, 'left': 3, 'up': 2, 'turn_left': 2}
+
+================================================================================
+
+MODEL: gpt-oss-120b
+--------------------------------------------------------------------------------
+Status: success
+
+Performance:
+  Episode Length: 20 steps
+  Total Time: 35.70 seconds
+  Time per Step: 1.785 seconds
+
+Agent Performance:
+  Agent 0:
+    Total Reward: 0.00
+    Average Reward: 0.0000
+    Communications Sent: 0
+  Agent 1:
+    Total Reward: 0.00
+    Average Reward: 0.0000
+    Communications Sent: 0
+
+Token Usage (Total):
+  Input Tokens: 0
+  Output Tokens: 0
+  Total Tokens: 0
+
+Token Usage (Average per Agent per Step):
+  Input Tokens: 0.0
+  Output Tokens: 0.0
+
+Action Distributions:
+  Agent 0: {'stay': 20}
+  Agent 1: {'stay': 20}
+
+================================================================================
+
