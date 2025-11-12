@@ -1,9 +1,9 @@
 "LR": 0.0005
 "NUM_ENVS": 512
 "NUM_STEPS": 100
-"TOTAL_TIMESTEPS": 5e7  # Each sweep run will train for 100M timesteps
+"TOTAL_TIMESTEPS": 1e7  # Each sweep run will train for 10M timesteps
 "UPDATE_EPOCHS": 2
-"NUM_MINIBATCHES": 512  # Must evenly divide NUM_ACTORS * NUM_STEPS (512*100=51200 or 1024*100=102400)
+"NUM_MINIBATCHES": 128  # Must evenly divide NUM_ACTORS * NUM_STEPS (512*100=51200 or 1024*100=102400)
 "GAMMA": 0.99
 "GAE_LAMBDA": 0.95
 "CLIP_EPS": 0.2
@@ -16,7 +16,7 @@
 "SHAPING_BEGIN": 1e6
 "ENV_KWARGS": 
   "num_agents" : 2
-  "num_inner_steps" : 1000
+  "num_inner_steps" : 100
   "shared_rewards" : False # Attention: switch to False for individual rewards 
   "cnn" : True
   "jit" : True
@@ -28,7 +28,7 @@
 "TUNE": False  # Set to True to run non-PS ablation sweep (4 runs: 2×2 for SepReward×InfluenceTarget)
 
 "REWARD": "individual" # individual; common
-"GIF_NUM_FRAMES": 250
+"GIF_NUM_FRAMES": 100  # Should be <= num_inner_steps (episode length)
 "PARAMETER_SHARING": True  # Recommended True for communication; False for independent agents
 
 # Communication Parameters
