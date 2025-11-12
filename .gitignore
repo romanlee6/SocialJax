@@ -3,4 +3,6 @@ Fixed_gifs/
 outputs/
 wandb/
 checkpoints/
+llms/llm_benchmarks/
+llms/llm_simulation_output/
 *.pickle

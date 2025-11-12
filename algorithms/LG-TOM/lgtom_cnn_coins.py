@@ -908,7 +908,11 @@ def make_train_comm(config):
                 )
                 
                 # Compute social influence intrinsic reward (if enabled)
-                influence_reward_batch = jnp.zeros((config["NUM_ACTORS"],))
+                # In non-PS mode, we need shape (num_agents * NUM_ENVS,) to properly slice per agent
+                if config.get("PARAMETER_SHARING", True):
+                    influence_reward_batch = jnp.zeros((config["NUM_ACTORS"],))
+                else:
+                    influence_reward_batch = jnp.zeros((env.num_agents * config["NUM_ENVS"],))
                 if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
                     if config.get("PARAMETER_SHARING", True):
                         # PARAMETER SHARING CASE:
@@ -2188,10 +2192,10 @@ def tune(default_config):
         "parameters": {
             # Main sweep parameters for non-parameter-sharing ablation
             "PARAMETER_SHARING": {"values": [False]},  # Only non-parameter-sharing
-            "USE_SEPARATE_REWARDS": {"values": [True, False]},  # Separate vs combined training
-            "INFLUENCE_TARGET": {"values": ["belief", "action"]},  # Cosine sim vs KL div
-            "SOCIAL_INFLUENCE_COEFF": {"values": [0.1]},  # Fixed coefficient
-            "SEED": {"values": [42]},  # Fixed seed
+            "USE_SEPARATE_REWARDS": {"values": [True]},  # Separate vs combined training
+            "INFLUENCE_TARGET": {"values": ["belief"]},  # Cosine sim vs KL div
+            "SOCIAL_INFLUENCE_COEFF": {"values": [0,0.1]},  # Fixed coefficient
+            "SEED": {"values": [42,43,44]},  # Fixed seed
             
             # Fixed settings
             "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards

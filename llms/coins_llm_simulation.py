@@ -599,6 +599,12 @@ class TrajectoryLogger:
             "timesteps": []
         }
         
+        # Interaction history (all communications between agents)
+        self.interaction_history = {
+            "metadata": self.metadata,
+            "interactions": []
+        }
+        
         # Performance tracking
         self.cumulative_rewards = [0.0] * num_agents
         self.episode_lengths = 0
@@ -655,14 +661,29 @@ class TrajectoryLogger:
         }
         
         for agent_data in agents_data:
-            # Raw agent data
+            # Raw agent data - capture EVERYTHING
             raw_agent = {
                 "agent_id": agent_data.get("agent_id"),
                 "llm_input": agent_data.get("llm_input", ""),
                 "llm_output": agent_data.get("llm_output", ""),
-                "api_response": agent_data.get("api_response")
+                "api_response": agent_data.get("api_response"),
+                "observation": agent_data.get("observation", ""),
+                "belief": agent_data.get("belief", ""),
+                "action": agent_data.get("action", "stay"),
+                "action_idx": agent_data.get("action_idx", 6),
+                "communication": agent_data.get("communication", "[No message]"),
+                "received_messages": agent_data.get("received_messages", [])
             }
             raw_step["agents"].append(raw_agent)
+            
+            # Track interactions (communications)
+            if agent_data.get("communication") and agent_data.get("communication") != "[No message]":
+                self.interaction_history["interactions"].append({
+                    "timestep": timestep,
+                    "sender_id": agent_data.get("agent_id"),
+                    "message": agent_data.get("communication"),
+                    "receiver_ids": [i for i in range(self.metadata["num_agents"]) if i != agent_data.get("agent_id")]
+                })
             
             # Parsed agent data
             parsed_agent = {
@@ -765,12 +786,12 @@ class TrajectoryLogger:
         # Close timestep log file
         self.timestep_log.close()
         
-        # Save raw trajectory
+        # Save raw trajectory (complete raw data from LLMs and environment)
         raw_path = os.path.join(self.save_dir, "trajectory_raw.json")
         with open(raw_path, 'w') as f:
             json.dump(self.raw_trajectory, f, indent=2)
         
-        # Save parsed trajectory
+        # Save parsed trajectory (structured for RL/IL training)
         parsed_path = os.path.join(self.save_dir, "trajectory_parsed.json")
         with open(parsed_path, 'w') as f:
             json.dump(self.parsed_trajectory, f, indent=2)
@@ -780,11 +801,49 @@ class TrajectoryLogger:
         with open(human_path, 'w') as f:
             json.dump(self.human_readable_log, f, indent=2)
         
+        # Save interaction history
+        interaction_path = os.path.join(self.save_dir, "interaction_history.json")
+        with open(interaction_path, 'w') as f:
+            json.dump(self.interaction_history, f, indent=2)
+        
         # Save statistics
         stats = self._compute_statistics()
         stats_path = os.path.join(self.save_dir, "trajectory_stats.json")
         with open(stats_path, 'w') as f:
             json.dump(stats, f, indent=2)
+        
+        # Generate and save human-readable summary
+        summary = self._generate_human_summary(stats)
+        summary_path = os.path.join(self.save_dir, "human_summary.txt")
+        with open(summary_path, 'w') as f:
+            f.write(summary)
+        
+        # Generate and save interaction history as text
+        interaction_text = self._generate_interaction_history_text()
+        interaction_text_path = os.path.join(self.save_dir, "interaction_history.txt")
+        with open(interaction_text_path, 'w') as f:
+            f.write(interaction_text)
+        
+        # Generate and save file manifest
+        manifest = self._generate_file_manifest()
+        manifest_path = os.path.join(self.save_dir, "FILE_MANIFEST.txt")
+        with open(manifest_path, 'w') as f:
+            f.write(manifest)
+        
+        # Print summary of saved files
+        print(f"\nSaved trajectory data to: {self.save_dir}")
+        print("Files saved:")
+        print("  - trajectory_raw.json (complete raw LLM and environment data)")
+        print("  - trajectory_parsed.json (structured data for training)")
+        print("  - timestep_log.txt (detailed per-timestep log)")
+        print("  - human_summary.txt (comprehensive summary)")
+        print("  - interaction_history.txt (communication log)")
+        print("  - interaction_history.json (structured interactions)")
+        print("  - trajectory_stats.json (performance statistics)")
+        print("  - debug_human_readable.json (human-readable JSON)")
+        print("  - FILE_MANIFEST.txt (file documentation)")
+        print(f"  - {self.episode_lengths} PNG files (timestep_XXXX.png)")
+        print("  - simulation.gif (animated visualization)")
     
     def _compute_statistics(self) -> Dict:
         """Compute statistics from the parsed trajectory."""
@@ -840,6 +899,218 @@ class TrajectoryLogger:
             print(f"  Average Return: {avg_return:.4f}")
         
         print("="*70)
+    
+    def _generate_human_summary(self, stats: Dict) -> str:
+        """Generate a comprehensive human-readable summary of the simulation."""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("SIMULATION SUMMARY")
+        lines.append("=" * 80)
+        lines.append("")
+        
+        # Metadata
+        lines.append("EXPERIMENT METADATA:")
+        lines.append(f"  Model: {self.metadata['model']}")
+        lines.append(f"  Temperature: {self.metadata['temperature']}")
+        lines.append(f"  Seed: {self.metadata['seed']}")
+        lines.append(f"  Timestamp: {self.metadata['timestamp']}")
+        lines.append(f"  Total Timesteps: {stats['total_timesteps']}")
+        lines.append(f"  Episode Length: {stats['episode_length']}")
+        lines.append("")
+        
+        # Agent performance
+        lines.append("=" * 80)
+        lines.append("AGENT PERFORMANCE")
+        lines.append("=" * 80)
+        for agent_stats in stats['agents']:
+            agent_id = agent_stats['agent_id']
+            lines.append(f"\nAgent {agent_id}:")
+            lines.append(f"  Total Reward: {agent_stats['total_reward']:.2f}")
+            lines.append(f"  Average Return per Timestep: {agent_stats['average_return']:.4f}")
+            lines.append(f"  Number of Communications Sent: {agent_stats['num_communications']}")
+            lines.append(f"  Average Belief Length: {agent_stats['avg_belief_length']:.1f} characters")
+            lines.append("")
+            lines.append("  Action Distribution:")
+            for action, count in sorted(agent_stats['action_distribution'].items(), 
+                                       key=lambda x: x[1], reverse=True):
+                percentage = (count / stats['total_timesteps']) * 100
+                lines.append(f"    {action}: {count} times ({percentage:.1f}%)")
+        lines.append("")
+        
+        # Interaction summary
+        lines.append("=" * 80)
+        lines.append("COMMUNICATION SUMMARY")
+        lines.append("=" * 80)
+        total_interactions = len(self.interaction_history['interactions'])
+        lines.append(f"Total Communications: {total_interactions}")
+        
+        if total_interactions > 0:
+            # Count by sender
+            comms_by_agent = {}
+            for interaction in self.interaction_history['interactions']:
+                sender = interaction['sender_id']
+                comms_by_agent[sender] = comms_by_agent.get(sender, 0) + 1
+            
+            lines.append("\nCommunications by Agent:")
+            for agent_id in sorted(comms_by_agent.keys()):
+                lines.append(f"  Agent {agent_id}: {comms_by_agent[agent_id]} messages")
+        else:
+            lines.append("\nNo communications occurred during this simulation.")
+        lines.append("")
+        
+        # Key events timeline
+        lines.append("=" * 80)
+        lines.append("KEY EVENTS TIMELINE")
+        lines.append("=" * 80)
+        
+        # Find timesteps with significant events
+        significant_events = []
+        for step in self.human_readable_log['timesteps']:
+            timestep = step['timestep']
+            events = []
+            
+            for agent_data in step['agents']:
+                # Check for communications
+                if agent_data['communication'] != "[No message]":
+                    events.append(f"Agent {agent_data['agent_id']} sent message: '{agent_data['communication'][:50]}...'")
+                
+                # Check for high rewards
+                if abs(agent_data['reward']) > 0.5:
+                    events.append(f"Agent {agent_data['agent_id']} received reward: {agent_data['reward']:.2f}")
+            
+            if events:
+                significant_events.append((timestep, events))
+        
+        if significant_events:
+            for timestep, events in significant_events[:20]:  # Show first 20 significant events
+                lines.append(f"\nTimestep {timestep}:")
+                for event in events:
+                    lines.append(f"  - {event}")
+        else:
+            lines.append("\nNo significant events detected.")
+        lines.append("")
+        
+        # Final state
+        if self.human_readable_log['timesteps']:
+            final_step = self.human_readable_log['timesteps'][-1]
+            lines.append("=" * 80)
+            lines.append("FINAL STATE")
+            lines.append("=" * 80)
+            for agent_data in final_step['agents']:
+                lines.append(f"\nAgent {agent_data['agent_id']}:")
+                lines.append(f"  Position: {agent_data['position']}")
+                lines.append(f"  Facing: {agent_data['facing_direction']}")
+                lines.append(f"  Final Belief: {agent_data['belief'][:200]}...")
+        lines.append("")
+        lines.append("=" * 80)
+        
+        return "\n".join(lines)
+    
+    def _generate_interaction_history_text(self) -> str:
+        """Generate human-readable interaction history."""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("INTERACTION HISTORY")
+        lines.append("=" * 80)
+        lines.append("")
+        lines.append(f"Total Interactions: {len(self.interaction_history['interactions'])}")
+        lines.append("")
+        
+        if not self.interaction_history['interactions']:
+            lines.append("No interactions (communications) occurred during this simulation.")
+            return "\n".join(lines)
+        
+        # Group by timestep
+        current_timestep = None
+        for interaction in self.interaction_history['interactions']:
+            timestep = interaction['timestep']
+            if timestep != current_timestep:
+                if current_timestep is not None:
+                    lines.append("")
+                lines.append(f"--- Timestep {timestep} ---")
+                current_timestep = timestep
+            
+            sender = interaction['sender_id']
+            message = interaction['message']
+            receivers = interaction['receiver_ids']
+            
+            receiver_str = ", ".join([f"Agent {r}" for r in receivers])
+            lines.append(f"  Agent {sender} → {receiver_str}:")
+            lines.append(f"    \"{message}\"")
+        
+        lines.append("")
+        lines.append("=" * 80)
+        
+        return "\n".join(lines)
+    
+    def _generate_file_manifest(self) -> str:
+        """Generate a manifest documenting all saved files."""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("FILE MANIFEST")
+        lines.append("=" * 80)
+        lines.append("")
+        lines.append("This directory contains all data from the LLM agent simulation.")
+        lines.append("")
+        
+        lines.append("RAW DATA FILES:")
+        lines.append("  - trajectory_raw.json: Complete raw data including:")
+        lines.append("      * Full LLM inputs (prompts) for each agent at each timestep")
+        lines.append("      * Full LLM outputs (raw responses) for each agent")
+        lines.append("      * Complete API responses from OpenAI")
+        lines.append("      * All observations, beliefs, actions, communications")
+        lines.append("      * Complete environment state (grid, agent locations, etc.)")
+        lines.append("      * Environment observations (JAX arrays)")
+        lines.append("      * Rewards for each timestep")
+        lines.append("")
+        
+        lines.append("PARSED DATA FILES:")
+        lines.append("  - trajectory_parsed.json: Structured data for RL/IL training:")
+        lines.append("      * Parsed observations, beliefs, actions, communications")
+        lines.append("      * Compact environment state")
+        lines.append("      * Action indices and rewards")
+        lines.append("")
+        
+        lines.append("HUMAN-READABLE FILES:")
+        lines.append("  - timestep_log.txt: Detailed per-timestep log with all agent information")
+        lines.append("  - human_summary.txt: Comprehensive summary with:")
+        lines.append("      * Experiment metadata")
+        lines.append("      * Agent performance statistics")
+        lines.append("      * Communication summary")
+        lines.append("      * Key events timeline")
+        lines.append("      * Final state information")
+        lines.append("  - interaction_history.txt: Chronological log of all communications")
+        lines.append("  - interaction_history.json: Structured JSON of all interactions")
+        lines.append("  - debug_human_readable.json: Human-readable JSON format of trajectory")
+        lines.append("")
+        
+        lines.append("STATISTICS FILES:")
+        lines.append("  - trajectory_stats.json: Performance statistics including:")
+        lines.append("      * Total and average rewards per agent")
+        lines.append("      * Action distributions")
+        lines.append("      * Communication counts")
+        lines.append("      * Average belief lengths")
+        lines.append("")
+        
+        lines.append("VISUALIZATION FILES:")
+        lines.append("  - timestep_XXXX.png: PNG image for each timestep showing:")
+        lines.append("      * Game state visualization")
+        lines.append("      * Agent observations, beliefs, actions, communications")
+        lines.append("      * Rewards")
+        lines.append("  - simulation.gif: Animated GIF of the entire simulation")
+        lines.append("")
+        
+        lines.append("METADATA:")
+        lines.append(f"  - Experiment: {self.metadata['experiment_name']}")
+        lines.append(f"  - Model: {self.metadata['model']}")
+        lines.append(f"  - Temperature: {self.metadata['temperature']}")
+        lines.append(f"  - Seed: {self.metadata['seed']}")
+        lines.append(f"  - Timestamp: {self.metadata['timestamp']}")
+        lines.append(f"  - Total Timesteps: {self.episode_lengths}")
+        lines.append("")
+        lines.append("=" * 80)
+        
+        return "\n".join(lines)
 
 
 # ============================================================================
