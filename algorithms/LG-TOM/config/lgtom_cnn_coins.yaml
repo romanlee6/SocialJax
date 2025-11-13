@@ -1,9 +1,9 @@
 "LR": 0.0005
 "NUM_ENVS": 512
-"NUM_STEPS": 100
-"TOTAL_TIMESTEPS": 1e7  # Each sweep run will train for 10M timesteps
+"NUM_STEPS": 1000
+"TOTAL_TIMESTEPS": 2e7  # Each sweep run will train for 10M timesteps
 "UPDATE_EPOCHS": 2
-"NUM_MINIBATCHES": 128  # Must evenly divide NUM_ACTORS * NUM_STEPS (512*100=51200 or 1024*100=102400)
+"NUM_MINIBATCHES": 500  # Must evenly divide NUM_ACTORS * NUM_STEPS (512*100=51200 or 1024*100=102400)
 "GAMMA": 0.99
 "GAE_LAMBDA": 0.95
 "CLIP_EPS": 0.2
@@ -16,7 +16,7 @@
 "SHAPING_BEGIN": 1e6
 "ENV_KWARGS": 
   "num_agents" : 2
-  "num_inner_steps" : 100
+  "num_inner_steps" : 1000
   "shared_rewards" : False # Attention: switch to False for individual rewards 
   "cnn" : True
   "jit" : True
@@ -28,7 +28,7 @@
 "TUNE": False  # Set to True to run non-PS ablation sweep (4 runs: 2×2 for SepReward×InfluenceTarget)
 
 "REWARD": "individual" # individual; common
-"GIF_NUM_FRAMES": 100  # Should be <= num_inner_steps (episode length)
+"GIF_NUM_FRAMES": 250  # Should be <= num_inner_steps (episode length)
 "PARAMETER_SHARING": True  # Recommended True for communication; False for independent agents
 
 # Communication Parameters
@@ -38,11 +38,27 @@
 "HIDDEN_DIM": 128  # Hidden dimension for GRU (must be embedding_dim + comm_dim = 64 + 64)
 "COMM_MODE": "avg"  # Communication aggregation mode: 'avg' or 'sum'
 
-# Social Influence Intrinsic Reward Parameters
+# Theory of Mind (ToM) Parameters
+"USE_TOM": False  # Enable Theory of Mind prediction model
+"SUPERVISED_BELIEF": "none"  # Supervised belief training: "none", "ground_truth", or "llm"
+"SUPERVISED_COMM": "none"  # Supervised communication training: "none", "ground_truth", or "llm"
+"SUPERVISED_LOSS_COEF": 0.1  # Weight for supervised learning loss
+"LLM_DATA_PATH": ""  # Path to offline LLM dataset (*** UNDER CONSTRUCTION ***)
+# NOTE: When USE_TOM=True, supervised loss is ALWAYS backpropagated (if SUPERVISED_BELIEF != "none")
+# LOSS FUNCTION: Uses cosine similarity loss (1 - cos_sim) for both belief and communication
+#   - Belief supervision: ToM prediction vs other agents' actual belief states
+#   - Comm supervision: Communication vectors similarity across agents (encourages alignment)
+
+# Intrinsic Reward Parameters
+"USE_INTRINSIC_REWARD": False  # Enable intrinsic reward calculation (can be used with or without ToM)
 "SOCIAL_INFLUENCE_COEFF": 0.1  # Coefficient for social influence intrinsic reward
 "INFLUENCE_TARGET": "belief"  # What to measure influence on: "action" (KL div) or "belief" (cosine sim)
 "USE_SEPARATE_REWARDS": True  # Train action and comm heads with separate rewards
 "COMM_LOSS_COEF": 0.1  # Weight for communication policy loss
+# NOTE: Interaction between ToM and Intrinsic Reward:
+#   - If USE_INTRINSIC_REWARD=True AND USE_TOM=True: Uses ToM predictions in counterfactuals (efficient)
+#   - If USE_INTRINSIC_REWARD=True AND USE_TOM=False: Uses ground truth beliefs in influence calculation
+#   - Both modes work with PARAMETER_SHARING=True/False and USE_SEPARATE_REWARDS=True/False
 
 # WandB Params
 "ENTITY": ""

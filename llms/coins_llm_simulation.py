@@ -609,6 +609,12 @@ class TrajectoryLogger:
         self.cumulative_rewards = [0.0] * num_agents
         self.episode_lengths = 0
         
+        # Additional metrics tracking for visualization
+        self.accumulated_rewards_history = []  # List of arrays [timestep, agent_rewards]
+        self.coins_in_state_history = []  # List of [red_coins, green_coins] counts
+        self.own_color_eaten_history = []  # List of arrays [agent_own_coins_eaten]
+        self.other_color_eaten_history = []  # List of arrays [agent_other_coins_eaten]
+        
         # Log file handle for per-timestep logging
         self.timestep_log_path = os.path.join(self.save_dir, "timestep_log.txt")
         self.timestep_log = open(self.timestep_log_path, 'w')
@@ -620,7 +626,9 @@ class TrajectoryLogger:
                     agents_data: List[Dict],
                     env_obs: np.ndarray,
                     env_state,
-                    rewards: np.ndarray):
+                    rewards: np.ndarray,
+                    cumulative_own_eaten: np.ndarray = None,
+                    cumulative_other_eaten: np.ndarray = None):
         """
         Log a complete timestep with all agent and environment data.
         
@@ -731,6 +739,22 @@ class TrajectoryLogger:
         for i, r in enumerate(rewards):
             self.cumulative_rewards[i] += r
         self.episode_lengths += 1
+        
+        # Track additional metrics
+        # Accumulated rewards at this timestep
+        self.accumulated_rewards_history.append(np.array(self.cumulative_rewards.copy()))
+        
+        # Count coins in state (3 = red coin, 4 = green coin)
+        grid = np.array(env_state.grid)
+        red_coins = np.sum(grid == 3)
+        green_coins = np.sum(grid == 4)
+        self.coins_in_state_history.append([red_coins, green_coins])
+        
+        # Track own/other color coins eaten (cumulative)
+        if cumulative_own_eaten is not None:
+            self.own_color_eaten_history.append(cumulative_own_eaten.copy())
+        if cumulative_other_eaten is not None:
+            self.other_color_eaten_history.append(cumulative_other_eaten.copy())
     
     def _serialize_array(self, arr) -> List:
         """Convert JAX/numpy array to nested list for JSON serialization."""
@@ -830,6 +854,23 @@ class TrajectoryLogger:
         with open(manifest_path, 'w') as f:
             f.write(manifest)
         
+        # Save additional metrics as numpy arrays for visualization
+        if self.accumulated_rewards_history:
+            accumulated_rewards_array = np.array(self.accumulated_rewards_history)  # Shape: (timesteps, num_agents)
+            np.save(os.path.join(self.save_dir, "accumulated_rewards.npy"), accumulated_rewards_array)
+        
+        if self.coins_in_state_history:
+            coins_in_state_array = np.array(self.coins_in_state_history)  # Shape: (timesteps, 2) [red, green]
+            np.save(os.path.join(self.save_dir, "coins_in_state.npy"), coins_in_state_array)
+        
+        if self.own_color_eaten_history:
+            own_color_eaten_array = np.array(self.own_color_eaten_history)  # Shape: (timesteps, num_agents)
+            np.save(os.path.join(self.save_dir, "own_color_coins_eaten.npy"), own_color_eaten_array)
+        
+        if self.other_color_eaten_history:
+            other_color_eaten_array = np.array(self.other_color_eaten_history)  # Shape: (timesteps, num_agents)
+            np.save(os.path.join(self.save_dir, "other_color_coins_eaten.npy"), other_color_eaten_array)
+        
         # Print summary of saved files
         print(f"\nSaved trajectory data to: {self.save_dir}")
         print("Files saved:")
@@ -844,6 +885,10 @@ class TrajectoryLogger:
         print("  - FILE_MANIFEST.txt (file documentation)")
         print(f"  - {self.episode_lengths} PNG files (timestep_XXXX.png)")
         print("  - simulation.gif (animated visualization)")
+        print("  - accumulated_rewards.npy (cumulative rewards per agent over time)")
+        print("  - coins_in_state.npy (coin counts in environment over time)")
+        print("  - own_color_coins_eaten.npy (cumulative own-color coins eaten)")
+        print("  - other_color_coins_eaten.npy (cumulative other-color coins eaten)")
     
     def _compute_statistics(self) -> Dict:
         """Compute statistics from the parsed trajectory."""
@@ -1246,7 +1291,7 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     env = CoinGame(
         num_agents=2,
         num_inner_steps=1000,
-        regrow_rate=0.01,
+        regrow_rate=0.0005,
         payoff_matrix=[[1, 1, -2], [1, 1, -2]],
         cnn=True,
         shared_rewards = False
@@ -1281,6 +1326,10 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     # Simulation loop
     print(f"Running simulation for {num_steps} steps...")
     rewards = np.array([0.0, 0.0])
+    
+    # Track cumulative coin eating statistics
+    cumulative_own_eaten = np.array([0.0, 0.0])
+    cumulative_other_eaten = np.array([0.0, 0.0])
     
     for t in range(num_steps):
         print(f"Timestep {t}/{num_steps-1}", end="\r")
@@ -1341,7 +1390,8 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
             agents_data.append(agent_data)
         
         # Log timestep (before stepping environment, to log pre-action state)
-        logger.log_timestep(t, agents_data, obs_np, state_np, rewards)
+        logger.log_timestep(t, agents_data, obs_np, state_np, rewards,
+                           cumulative_own_eaten, cumulative_other_eaten)
         
         # Step environment
         key, subkey = jax.random.split(key)
@@ -1353,6 +1403,21 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
         obs_np = np.array(obs)
         state_np = jax.tree_util.tree_map(lambda x: np.array(x), state_np)
         rewards = np.array(rewards_new)
+        
+        # Update coin eating statistics
+        # info["eat_own_coins"] contains coins of own color eaten in this step
+        if "eat_own_coins" in info:
+            own_eaten_this_step = np.array(info["eat_own_coins"])
+            cumulative_own_eaten += own_eaten_this_step
+        
+        # Calculate other-color coins eaten from rewards
+        # Reward structure: +1 for any coin, but causes -2 to other agent if it's their color
+        # So if agent i gets +1 and agent j gets -2, agent i ate agent j's coin
+        for i in range(2):
+            j = 1 - i  # Other agent
+            # If agent i got positive reward and agent j got negative reward, i ate j's coin
+            if rewards[i] > 0 and rewards[j] < 0:
+                cumulative_other_eaten[i] += 1
         
         # Visualize
         visualizer.render_timestep(

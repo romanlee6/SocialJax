@@ -1,7 +1,32 @@
 """ 
 Based on PureJaxRL & jaxmarl Implementation of PPO with LG-TOM Communication
 
-This implementation includes Social Influence Intrinsic Reward via Counterfactual Reasoning:
+This implementation includes:
+1. Social Influence Intrinsic Reward via Counterfactual Reasoning
+2. Theory of Mind (ToM) Prediction Model
+3. Supervised Learning from Ground Truth or LLM Dataset
+
+THEORY OF MIND (ToM) MODEL:
+---------------------------
+The ToM model enables agents to predict other agents' belief states based on their 
+communication and observations. This implements a key component of human-like social reasoning.
+
+Components:
+- ToM Predictor Network: Takes (communication + embedded observation) as input and outputs
+  predicted belief states of other agents
+- Supervised Learning: ToM can be trained via:
+  * Ground truth supervision: Using actual belief states from other agents
+  * LLM dataset supervision: Using pre-collected LLM reasoning trajectories (UNDER CONSTRUCTION)
+  * Loss function: Cosine similarity loss (1 - cos_sim) for both belief and communication
+- Integration with Intrinsic Rewards: When both ToM and intrinsic rewards are enabled,
+  the ToM predictions are used for counterfactual reasoning in influence calculation
+
+Configuration:
+- USE_TOM: Enable/disable ToM prediction model
+- SUPERVISED_BELIEF: "none", "ground_truth", or "llm" 
+- SUPERVISED_COMM: "none", "ground_truth", or "llm"
+- SUPERVISED_LOSS_COEF: Weight for supervised learning loss
+- LLM_DATA_PATH: Path to offline LLM dataset (*** UNDER CONSTRUCTION ***)
 
 SOCIAL INFLUENCE MECHANISM:
 ---------------------------
@@ -39,12 +64,17 @@ Key Components:
    - This allows specialization: actions optimize task performance, comm optimizes influence
 
 Configuration Options:
-- SOCIAL_INFLUENCE_COEFF: Weight for intrinsic reward (0.0 = disabled)
+- USE_INTRINSIC_REWARD: Enable/disable intrinsic reward calculation (default: False)
+- SOCIAL_INFLUENCE_COEFF: Weight for intrinsic reward (0.0 = disabled, kept for backward compatibility)
 - INFLUENCE_TARGET: What to measure influence on
   * "belief": Measure impact on other agents' belief states (GRU output, not hidden state)
   * "action": Measure impact on other agents' action distributions (uses KL divergence)
 - USE_SEPARATE_REWARDS: Whether to use separate rewards for action and comm policies (default: True)
 - COMM_LOSS_COEF: Weight for communication policy loss (default: 0.1)
+
+Note: When both USE_TOM and USE_INTRINSIC_REWARD are enabled, the system uses ToM predictions
+for counterfactual belief states, making the intrinsic reward calculation more efficient and
+theoretically grounded.
 
 Implementation Notes:
 - Parameter Sharing: Uses agent's own policy to predict others (homogeneous assumption)
@@ -160,12 +190,20 @@ class ProtoLayer(nn.Module):
 
 
 class ActorCriticComm(nn.Module):
-    """Actor-Critic with Communication based on TomMAC architecture"""
+    """Actor-Critic with Communication based on TomMAC architecture
+    
+    Includes Theory of Mind (ToM) prediction capability:
+    - ToM model takes comm + embedded obs as input
+    - Outputs belief prediction of other agents
+    - Can be supervised on ground truth beliefs or offline LLM dataset
+    """
     action_dim: int
     comm_dim: int = 64
     num_protos: int = 10
     hidden_dim: int = 128  # Must match embedding_dim (64) + comm_dim (64)
     activation: str = "relu"
+    use_tom: bool = False  # Enable Theory of Mind prediction
+    use_intrinsic_reward: bool = False  # Enable intrinsic reward calculation
 
     @nn.compact
     def __call__(self, obs, prev_comm, hidden_state, train_mode=True):
@@ -176,7 +214,7 @@ class ActorCriticComm(nn.Module):
             hidden_state: GRU hidden state (batch, hidden_dim)
             train_mode: whether in training mode
         Returns:
-            action_logits, comm_vector, comm_logits, value, new_hidden_state
+            action_logits, comm_vector, comm_logits, value, new_hidden_state, belief, tom_pred (optional)
         """
         if self.activation == "relu":
             activation = nn.relu
@@ -194,7 +232,21 @@ class ActorCriticComm(nn.Module):
         gru_cell = nn.GRUCell(features=self.hidden_dim)
         new_hidden_state, belief = gru_cell(hidden_state, belief_input)
         
-        # 4. Communication Policy (using prototype layer)
+        # 4. Theory of Mind (ToM) Prediction (optional)
+        # Predicts other agents' belief states based on their communication and observations
+        tom_pred = None
+        if self.use_tom:
+            # ToM takes the same input as belief GRU (comm + embedding)
+            # and predicts what other agents believe
+            tom_pred = nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name='tom_predictor'
+            )(belief_input)
+            tom_pred = activation(tom_pred)
+        
+        # 5. Communication Policy (using prototype layer)
         proto_layer = ProtoLayer(num_protos=self.num_protos, comm_dim=self.comm_dim)
         comm_hidden = nn.Dense(
             self.hidden_dim,
@@ -207,7 +259,7 @@ class ActorCriticComm(nn.Module):
         gumbel_rng = self.make_rng('gumbel') if train_mode else None
         comm_vector, comm_logits = proto_layer(comm_hidden, train_mode=train_mode, rng=gumbel_rng)
         
-        # 5. Action Policy
+        # 6. Action Policy
         action_hidden = nn.Dense(
             self.hidden_dim,
             kernel_init=orthogonal(np.sqrt(2)),
@@ -220,7 +272,7 @@ class ActorCriticComm(nn.Module):
             bias_init=constant(0.0)
         )(action_hidden)
         
-        # 6. Critic (value function)
+        # 7. Critic (value function)
         critic = nn.Dense(
             self.hidden_dim,
             kernel_init=orthogonal(np.sqrt(2)),
@@ -233,10 +285,11 @@ class ActorCriticComm(nn.Module):
             bias_init=constant(0.0)
         )(critic)
         
-        # Return both belief and new_hidden_state
+        # Return belief, new_hidden_state, and optional tom_pred
         # belief: the GRU output used for action/comm generation
         # new_hidden_state: the carry state for next timestep
-        return action_logits, comm_vector, comm_logits, jnp.squeeze(value, axis=-1), new_hidden_state, belief
+        # tom_pred: ToM prediction of other agents' beliefs (if use_tom=True)
+        return action_logits, comm_vector, comm_logits, jnp.squeeze(value, axis=-1), new_hidden_state, belief, tom_pred
 
 
 class ActorCritic(nn.Module):
@@ -285,6 +338,8 @@ class TransitionComm(NamedTuple):
     comm_vector: jnp.ndarray
     comm_log_prob: jnp.ndarray
     hidden_state: jnp.ndarray
+    belief_state: jnp.ndarray  # Belief state (GRU output) for supervised learning
+    tom_prediction: jnp.ndarray  # ToM predictions (if enabled) for supervised learning
     info: jnp.ndarray
 
 
@@ -394,7 +449,7 @@ def aggregate_communication(comm_vectors, num_agents, comm_mode='avg'):
 
 def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden_batch, 
                             proto_embeddings, num_agents, num_protos, comm_dim, config, rng,
-                            parameter_sharing=True):
+                            parameter_sharing=True, tom_predictions=None):
     """
     Generate counterfactual predictions for what other agents would do/believe
     under each possible communication from the current agent.
@@ -403,6 +458,12 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
     
     For parameter sharing: Uses the shared policy to predict all agents' responses.
     For non-parameter sharing: Uses each agent's actual policy to predict their response.
+    
+    **ToM Integration:**
+    If both USE_TOM and USE_INTRINSIC_REWARD are enabled, uses ToM predictions
+    for counterfactual belief states instead of running full forward passes.
+    This is more efficient and aligns with the theory that agents reason about
+    others' beliefs through their ToM model.
     
     Dimension flow:
     1. Input: (num_envs * num_agents, ...) 
@@ -425,6 +486,7 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
         config: Configuration dict
         rng: Random key
         parameter_sharing: Whether using parameter sharing
+        tom_predictions: Optional ToM predictions (num_envs * num_agents, hidden_dim)
         
     Returns:
         counterfactuals: (num_agents, num_protos, num_agents, output_dim)
@@ -433,6 +495,22 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
             - hidden_dim (for belief influence): GRU output (belief), not hidden state
     """
     num_envs = obs_batch.shape[0] // num_agents
+    
+    # Check if we should use ToM predictions for counterfactuals
+    use_tom_counterfactuals = (
+        config.get("USE_TOM", False) and 
+        config.get("USE_INTRINSIC_REWARD", False) and 
+        tom_predictions is not None
+    )
+    
+    # Note on the difference between ToM and non-ToM counterfactuals:
+    # BOTH cases run full forward passes with permuted communications.
+    # The difference is WHICH output we extract:
+    # - WITH ToM (use_tom_counterfactuals=True): Extract ToM predictions as counterfactual beliefs
+    #   This represents the agent's mental model of how others would think under different comms
+    # - WITHOUT ToM (use_tom_counterfactuals=False): Extract actual belief states as counterfactual beliefs  
+    #   This represents the ground truth of how others actually would think
+    # In both cases, actual_outputs in compute_social_influence_reward() contains current beliefs.
     
     # Reshape to (num_envs, num_agents, ...)
     obs_reshaped = obs_batch.reshape(num_envs, num_agents, *obs_batch.shape[1:])
@@ -498,11 +576,12 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
     aggregated_comm_flat = aggregated_comm.reshape(-1, comm_dim)
     
     # Forward pass through network to get counterfactual predictions
+    # The key difference when using ToM: we extract ToM predictions instead of actual beliefs
     rng_split = jax.random.split(rng, batch_size)
     
     if parameter_sharing:
         # Use shared policy for all agents
-        action_logits_cf, _, _, _, hidden_cf, belief_cf = jax.vmap(
+        action_logits_cf, _, _, _, hidden_cf, belief_cf, tom_pred_cf = jax.vmap(
             lambda obs, comm, hid, r: network.apply(
                 params,
                 jnp.expand_dims(obs, 0),
@@ -520,6 +599,7 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
         all_action_logits = []
         all_hidden = []
         all_belief = []
+        all_tom_pred = []
         
         for agent_idx in range(num_agents):
             # Get indices for this receiving agent
@@ -533,7 +613,7 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
             rng_agent = rng_split[agent_indices]
             
             # Apply this agent's policy
-            action_logits_i, _, _, _, hidden_i, belief_i = jax.vmap(
+            action_logits_i, _, _, _, hidden_i, belief_i, tom_pred_i = jax.vmap(
                 lambda obs, comm, hid, r: network[agent_idx].apply(
                     params[agent_idx],
                     jnp.expand_dims(obs, 0),
@@ -547,6 +627,7 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
             all_action_logits.append(action_logits_i)
             all_hidden.append(hidden_i)
             all_belief.append(belief_i)
+            all_tom_pred.append(tom_pred_i)
         
         # Interleave results to match the batch structure
         # Stack and reshape to get back to (batch_size, ...) order
@@ -558,10 +639,14 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
         
         belief_cf = jnp.stack(all_belief, axis=1)
         belief_cf = belief_cf.reshape(batch_size, -1)
+        
+        tom_pred_cf = jnp.stack(all_tom_pred, axis=1)
+        tom_pred_cf = tom_pred_cf.reshape(batch_size, -1)
     
     # Reshape to (num_agents, num_protos, num_envs, num_agents, ...)
     action_logits_cf = action_logits_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
     belief_cf = belief_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
+    tom_pred_cf = tom_pred_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
     
     # Average over environments
     if config.get("INFLUENCE_TARGET", "belief") == "action":
@@ -569,8 +654,14 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
         action_probs = jax.nn.softmax(action_logits_cf, axis=-1)
         return action_probs.mean(axis=2)  # (num_agents, num_protos, num_agents, action_dim)
     else:
-        # Return belief states (GRU output, not hidden state)
-        return belief_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
+        # Return belief states: use ToM predictions if enabled, otherwise use actual beliefs
+        if use_tom_counterfactuals and tom_pred_cf is not None:
+            # Use ToM predictions as counterfactual beliefs
+            # This represents each agent's theory of how others' beliefs change with different communications
+            return tom_pred_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
+        else:
+            # Use actual belief states (ground truth) as counterfactual beliefs
+            return belief_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
 
 
 def marginalize_over_own_comm(comm_probs, counterfactuals, epsilon=1e-8):
@@ -621,6 +712,104 @@ def compute_kl_divergence(p, q, epsilon=1e-8):
     p = jnp.clip(p, epsilon, 1.0)
     q = jnp.clip(q, epsilon, 1.0)
     return jnp.sum(p * jnp.log(p / q))
+
+
+def compute_supervised_belief_loss(tom_predictions, ground_truth_beliefs, config):
+    """
+    Compute supervised loss for ToM belief predictions using cosine similarity.
+    
+    Args:
+        tom_predictions: (num_envs * num_agents, hidden_dim) - ToM predicted beliefs
+        ground_truth_beliefs: (num_envs * num_agents, hidden_dim) - actual belief states of other agents
+        config: Configuration dict
+        
+    Returns:
+        loss: scalar supervised loss value (1 - cosine_similarity)
+    """
+    # Compute cosine similarity
+    dot_product = jnp.sum(tom_predictions * ground_truth_beliefs, axis=-1)
+    tom_norm = jnp.linalg.norm(tom_predictions, axis=-1) + 1e-8
+    belief_norm = jnp.linalg.norm(ground_truth_beliefs, axis=-1) + 1e-8
+    cos_sim = dot_product / (tom_norm * belief_norm)
+    
+    # Loss = 1 - cosine_similarity (minimize to increase similarity)
+    loss = jnp.mean(1.0 - cos_sim)
+    return loss
+
+
+def compute_supervised_comm_loss(comm_vectors, target_comm_vectors, config):
+    """
+    Compute supervised loss for communication based on cosine similarity.
+    
+    Args:
+        comm_vectors: (num_envs * num_agents, comm_dim) - predicted communication vectors
+        target_comm_vectors: (num_envs * num_agents, comm_dim) - target communication vectors
+        config: Configuration dict
+        
+    Returns:
+        loss: scalar supervised loss value (1 - cosine_similarity)
+    """
+    # Compute cosine similarity between predicted and target communication vectors
+    dot_product = jnp.sum(comm_vectors * target_comm_vectors, axis=-1)
+    comm_norm = jnp.linalg.norm(comm_vectors, axis=-1) + 1e-8
+    target_norm = jnp.linalg.norm(target_comm_vectors, axis=-1) + 1e-8
+    cos_sim = dot_product / (comm_norm * target_norm)
+    
+    # Loss = 1 - cosine_similarity (minimize to increase similarity)
+    loss = jnp.mean(1.0 - cos_sim)
+    return loss
+
+
+def load_offline_llm_dataset(data_path, env_name, config):
+    """
+    Load offline LLM dataset for supervised communication/belief training.
+    
+    *** UNDER CONSTRUCTION ***
+    This function is a placeholder for loading pre-collected LLM interaction data.
+    
+    The dataset should contain:
+    - State observations
+    - Communication embeddings from LLM reasoning
+    - Belief state predictions
+    - Action distributions
+    
+    Expected format:
+    {
+        'observations': array of shape (N, obs_dim),
+        'communications': array of shape (N, comm_dim),
+        'beliefs': array of shape (N, hidden_dim),
+        'actions': array of shape (N, action_dim),
+        'state_keys': list of state tuples for indexing
+    }
+    
+    TODO:
+    - Define exact data format specification
+    - Implement data loading from pickle/numpy files
+    - Add data preprocessing and normalization
+    - Implement state matching/similarity functions
+    - Add caching for efficiency
+    
+    Args:
+        data_path: str, path to offline dataset
+        env_name: str, name of environment
+        config: Configuration dict
+        
+    Returns:
+        dataset: dict containing offline data, or None if not available
+    """
+    # PLACEHOLDER IMPLEMENTATION
+    print("="*70)
+    print("WARNING: Offline LLM dataset loading is UNDER CONSTRUCTION")
+    print("This feature is not yet fully implemented.")
+    print("To use supervised learning from LLM data:")
+    print("  1. Collect LLM trajectories using llms/coins_llm_simulation.py")
+    print("  2. Process and format the data into required structure")
+    print("  3. Implement data loading logic in this function")
+    print("  4. Set SUPERVISED_COMM or SUPERVISED_BELIEF to 'llm' in config")
+    print("="*70)
+    
+    # Return None to indicate dataset not available
+    return None
 
 
 def compute_social_influence_reward(belief_states, comm_logits, counterfactuals, 
@@ -730,7 +919,9 @@ def make_train_comm(config):
                 comm_dim=config.get("COMM_DIM", 64),
                 num_protos=config.get("NUM_PROTOS", 10),
                 hidden_dim=config.get("HIDDEN_DIM", 128),
-                activation=config["ACTIVATION"]
+                activation=config["ACTIVATION"],
+                use_tom=config.get("USE_TOM", False),
+                use_intrinsic_reward=config.get("USE_INTRINSIC_REWARD", False)
             )
         else:
             network = [ActorCriticComm(
@@ -738,7 +929,9 @@ def make_train_comm(config):
                 comm_dim=config.get("COMM_DIM", 64),
                 num_protos=config.get("NUM_PROTOS", 10),
                 hidden_dim=config.get("HIDDEN_DIM", 128),
-                activation=config["ACTIVATION"]
+                activation=config["ACTIVATION"],
+                use_tom=config.get("USE_TOM", False),
+                use_intrinsic_reward=config.get("USE_INTRINSIC_REWARD", False)
             ) for _ in range(env.num_agents)]
         
         rng, _rng = jax.random.split(rng)
@@ -812,7 +1005,7 @@ def make_train_comm(config):
                     prev_comm_batch = prev_comm.reshape(-1, config.get("COMM_DIM", 64))
                     
                     # Forward pass through network
-                    action_logits, comm_vectors, comm_logits, values, new_hidden_batch, belief_batch = network.apply(
+                    action_logits, comm_vectors, comm_logits, values, new_hidden_batch, belief_batch, tom_pred_batch = network.apply(
                         train_state.params,
                         obs_batch,
                         prev_comm_batch,
@@ -851,9 +1044,10 @@ def make_train_comm(config):
                     belief_batch_list = []
                     comm_logits_list = []
                     
+                    tom_pred_batch_list = []
                     for i in range(env.num_agents):
                         # Forward pass for agent i
-                        action_logits_i, comm_vectors_i, comm_logits_i, values_i, new_hidden_i, belief_i = network[i].apply(
+                        action_logits_i, comm_vectors_i, comm_logits_i, values_i, new_hidden_i, belief_i, tom_pred_i = network[i].apply(
                             train_state[i].params,
                             obs_batch[i],
                             prev_comm[:, i],
@@ -880,6 +1074,7 @@ def make_train_comm(config):
                         action_logits_list.append(action_logits_i)
                         belief_batch_list.append(belief_i)
                         comm_logits_list.append(comm_logits_i)
+                        tom_pred_batch_list.append(tom_pred_i)
                     
                     # Stack results
                     actions_reshaped = jnp.stack([env_act[env.agents[i]] for i in range(env.num_agents)], axis=1)
@@ -913,7 +1108,8 @@ def make_train_comm(config):
                     influence_reward_batch = jnp.zeros((config["NUM_ACTORS"],))
                 else:
                     influence_reward_batch = jnp.zeros((env.num_agents * config["NUM_ENVS"],))
-                if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
+                # Enable intrinsic reward if USE_INTRINSIC_REWARD is True OR if SOCIAL_INFLUENCE_COEFF > 0
+                if config.get("USE_INTRINSIC_REWARD", False) or config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
                     if config.get("PARAMETER_SHARING", True):
                         # PARAMETER SHARING CASE:
                         # In parameter sharing, we can directly use the agent's own policy
@@ -936,7 +1132,8 @@ def make_train_comm(config):
                             comm_dim=config.get("COMM_DIM", 64),
                             config=config,
                             rng=_rng_cf,
-                            parameter_sharing=True
+                            parameter_sharing=True,
+                            tom_predictions=tom_pred_batch
                         )
                         
                         # Determine what to measure influence on
@@ -981,6 +1178,12 @@ def make_train_comm(config):
                         prev_comm_flat = prev_comm_reshaped.reshape(-1, config.get("COMM_DIM", 64))
                         hidden_flat = hidden_reshaped.reshape(-1, hidden_reshaped.shape[-1])
                         
+                        # Stack ToM predictions if available
+                        tom_pred_flat = None
+                        if tom_pred_batch_list and tom_pred_batch_list[0] is not None:
+                            tom_pred_stacked = jnp.stack([tom_pred_batch_list[i] for i in range(env.num_agents)], axis=0)
+                            tom_pred_flat = tom_pred_stacked.reshape(-1, tom_pred_stacked.shape[-1])
+                        
                         # Generate counterfactuals using each agent's own policy
                         rng, _rng_cf = jax.random.split(rng)
                         counterfactuals = generate_counterfactuals(
@@ -995,7 +1198,8 @@ def make_train_comm(config):
                             comm_dim=config.get("COMM_DIM", 64),
                             config=config,
                             rng=_rng_cf,
-                            parameter_sharing=False
+                            parameter_sharing=False,
+                            tom_predictions=tom_pred_flat
                         )
                         
                         # Determine what to measure influence on
@@ -1061,6 +1265,13 @@ def make_train_comm(config):
                         info['env_reward_only'] = env_reward.reshape(config["NUM_ENVS"], env.num_agents)
                     
                     info = jax.tree_util.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                    
+                    # Handle ToM predictions - use zeros if ToM is disabled
+                    if tom_pred_batch is not None:
+                        tom_pred_for_storage = tom_pred_batch
+                    else:
+                        tom_pred_for_storage = jnp.zeros_like(belief_batch)
+                    
                     transition = TransitionComm(
                         batchify_dict(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                         actions,
@@ -1073,6 +1284,8 @@ def make_train_comm(config):
                         comm_vectors,
                         comm_log_probs,
                         hidden_batch,
+                        belief_batch,  # Store belief states for supervised learning
+                        tom_pred_for_storage,  # Store ToM predictions (or zeros if disabled)
                         info,
                     )
                 else:
@@ -1093,6 +1306,13 @@ def make_train_comm(config):
                         agent_comm_reward = influence_reward_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]] * config.get("SOCIAL_INFLUENCE_COEFF", 0.0)
                         agent_total_reward = agent_action_reward + agent_comm_reward
                         
+                        # Get belief and ToM prediction for this agent
+                        agent_belief = belief_batch_list[i]
+                        if tom_pred_batch_list and tom_pred_batch_list[i] is not None:
+                            agent_tom_pred = tom_pred_batch_list[i]
+                        else:
+                            agent_tom_pred = jnp.zeros_like(agent_belief)
+                        
                         transition.append(TransitionComm(
                             done_list[i],
                             env_act[i],
@@ -1105,6 +1325,8 @@ def make_train_comm(config):
                             comm_vectors[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             comm_log_probs[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             hidden_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
+                            agent_belief,  # Store belief states for supervised learning
+                            agent_tom_pred,  # Store ToM predictions (or zeros if disabled)
                             info_i,
                         ))
                 
@@ -1123,7 +1345,7 @@ def make_train_comm(config):
                 last_hidden_batch = hidden_states.reshape(-1, config.get("HIDDEN_DIM", 128))
                 last_comm_batch = prev_comm.reshape(-1, config.get("COMM_DIM", 64))
                 
-                _, _, _, last_val, _, _ = network.apply(
+                _, _, _, last_val, _, _, _ = network.apply(
                     train_state.params,
                     last_obs_batch,
                     last_comm_batch,
@@ -1135,7 +1357,7 @@ def make_train_comm(config):
                 last_obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
                 last_val = []
                 for i in range(env.num_agents):
-                    _, _, _, last_val_i, _, _ = network[i].apply(
+                    _, _, _, last_val_i, _, _, _ = network[i].apply(
                         train_state[i].params,
                         last_obs_batch[i],
                         prev_comm[:, i],
@@ -1290,7 +1512,7 @@ def make_train_comm(config):
                         aggregated = aggregate_communication(comm_reshaped, env.num_agents, config.get("COMM_MODE", "avg"))
                         prev_comm_recon = aggregated.reshape(batch_size, comm_dim)
                         
-                        action_logits, _, comm_logits, values, _, _ = network_used.apply(
+                        action_logits, _, comm_logits, values, _, belief_recomputed, tom_pred_recomputed = network_used.apply(
                             params,
                             traj_batch.obs,
                             prev_comm_recon,
@@ -1346,13 +1568,89 @@ def make_train_comm(config):
                         # Loss for comm: negative advantage-weighted entropy (encourages high-reward comms)
                         loss_comm = -comm_gae_normalized.mean() * comm_entropy
                         
+                        # SUPERVISED LEARNING LOSS (when ToM is enabled)
+                        # Uses cosine similarity loss for both belief and communication supervision
+                        supervised_loss = 0.0
+                        if config.get("USE_TOM", False):
+                            supervised_belief = config.get("SUPERVISED_BELIEF", "none")
+                            supervised_comm = config.get("SUPERVISED_COMM", "none")
+                            
+                            # Supervised belief loss (using cosine similarity)
+                            if supervised_belief == "ground_truth" and tom_pred_recomputed is not None:
+                                # Reshape to (num_envs, num_agents, hidden_dim)
+                                num_envs = batch_size // env.num_agents
+                                belief_reshaped = traj_batch.belief_state.reshape(num_envs, env.num_agents, hidden_dim)
+                                tom_pred_reshaped = tom_pred_recomputed.reshape(num_envs, env.num_agents, hidden_dim)
+                                
+                                # For each agent, predict other agents' beliefs
+                                # Ground truth: belief_reshaped[:, j] for agent j
+                                # ToM prediction from agent i: tom_pred_reshaped[:, i]
+                                # We want agent i's ToM to predict all other agents' beliefs
+                                
+                                # Expand to compare each agent's ToM pred with each other agent's belief
+                                # Use cross-agent supervision: agent i predicts agent j's belief (i != j)
+                                tom_expanded = jnp.expand_dims(tom_pred_reshaped, 2)  # (num_envs, num_agents, 1, hidden_dim)
+                                belief_expanded = jnp.expand_dims(belief_reshaped, 1)  # (num_envs, 1, num_agents, hidden_dim)
+                                
+                                # Compute cosine similarity: dot(a, b) / (||a|| * ||b||)
+                                # Shape: (num_envs, num_agents, num_agents)
+                                dot_product = jnp.sum(tom_expanded * belief_expanded, axis=-1)
+                                tom_norm = jnp.linalg.norm(tom_expanded, axis=-1) + 1e-8
+                                belief_norm = jnp.linalg.norm(belief_expanded, axis=-1) + 1e-8
+                                cos_sim = dot_product / (tom_norm * belief_norm)
+                                
+                                # Loss = 1 - cosine_similarity (want high similarity, so minimize 1 - sim)
+                                belief_loss = 1.0 - cos_sim  # (num_envs, num_agents, num_agents)
+                                
+                                # Mask out self-prediction (diagonal)
+                                mask = 1.0 - jnp.eye(env.num_agents)  # (num_agents, num_agents)
+                                mask = jnp.expand_dims(mask, 0)  # (1, num_agents, num_agents)
+                                
+                                masked_belief_loss = belief_loss * mask
+                                supervised_loss += jnp.mean(masked_belief_loss) * config.get("SUPERVISED_LOSS_COEF", 0.1)
+                            
+                            elif supervised_belief == "llm":
+                                # LLM dataset supervision (UNDER CONSTRUCTION)
+                                # Would load target beliefs from offline LLM dataset and compute cosine similarity
+                                pass
+                            
+                            # Supervised communication loss (using cosine similarity)
+                            if supervised_comm == "ground_truth":
+                                # Supervise communication vectors to be similar across agents
+                                # Reshape communication vectors: (batch_size, comm_dim) -> (num_envs, num_agents, comm_dim)
+                                comm_reshaped = traj_batch.comm_vector.reshape(num_envs, env.num_agents, comm_dim)
+                                
+                                # Compare each agent's communication with other agents' communications
+                                # This encourages agents to develop similar communication patterns
+                                comm_i = jnp.expand_dims(comm_reshaped, 2)  # (num_envs, num_agents, 1, comm_dim)
+                                comm_j = jnp.expand_dims(comm_reshaped, 1)  # (num_envs, 1, num_agents, comm_dim)
+                                
+                                # Compute cosine similarity between communications
+                                dot_product = jnp.sum(comm_i * comm_j, axis=-1)
+                                comm_i_norm = jnp.linalg.norm(comm_i, axis=-1) + 1e-8
+                                comm_j_norm = jnp.linalg.norm(comm_j, axis=-1) + 1e-8
+                                comm_cos_sim = dot_product / (comm_i_norm * comm_j_norm)
+                                
+                                # Loss = 1 - cosine_similarity (encourage similar communications)
+                                comm_loss_matrix = 1.0 - comm_cos_sim  # (num_envs, num_agents, num_agents)
+                                
+                                # Mask out self-comparison (diagonal)
+                                comm_loss_masked = comm_loss_matrix * mask
+                                supervised_loss += jnp.mean(comm_loss_masked) * config.get("SUPERVISED_LOSS_COEF", 0.1)
+                            
+                            elif supervised_comm == "llm":
+                                # LLM dataset supervision for communication
+                                # Would compare communication vectors with LLM-generated communication embeddings
+                                pass
+                        
                         total_loss = (
                             loss_actor
                             + config.get("COMM_LOSS_COEF", 0.1) * loss_comm  # Separate coefficient for comm loss
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
+                            + supervised_loss  # Add supervised learning loss
                         )
-                        return total_loss, (value_loss, loss_actor, loss_comm, entropy, comm_entropy)
+                        return total_loss, (value_loss, loss_actor, loss_comm, entropy, comm_entropy, supervised_loss)
                     
                     rng, _rng = jax.random.split(update_state[-1])
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -2163,26 +2461,57 @@ def evaluate(params, env, save_path, config):
 
 def tune(default_config):
     """
-    Hyperparameter sweep with wandb for social influence experiments.
+    Hyperparameter sweep with wandb for ToM and Intrinsic Reward experiments.
     
     Experiments (NON-PARAMETER-SHARING ONLY):
-    - Parameter sharing: False (individual policies with direct policy access)
-    - Separate rewards: True vs False (separate action/comm training vs combined)
-    - Influence target: Belief vs Action states (cosine sim vs KL divergence)
+    - Parameter sharing: False (individual policies)
+    - Influence target: belief (cosine similarity)
     - Seed: 42 (fixed)
-    - Social influence coefficient: 0.1 (fixed)
+    - Individual rewards (not shared)
     
-    Current sweep: Separate Rewards × Influence Target
-    Total runs: 2 × 2 = 4 experiments
+    Current sweep: USE_TOM × USE_INTRINSIC_REWARD × USE_SEPARATE_REWARDS
+    - USE_TOM: True/False (ordered True first)
+    - USE_INTRINSIC_REWARD: True/False
+    - USE_SEPARATE_REWARDS: True/False (for intrinsic conditions)
     
-    All experiments train with communication enabled and WITHOUT parameter sharing.
+    Conditional Settings:
+    - If USE_INTRINSIC_REWARD=True: SOCIAL_INFLUENCE_COEFF=0.1
+    - If USE_INTRINSIC_REWARD=False: 
+      * SOCIAL_INFLUENCE_COEFF=0.0
+      * USE_SEPARATE_REWARDS=False (forced, both get task reward)
+    - If USE_TOM=True: SUPERVISED_BELIEF="ground_truth"
+    
+    Total runs: 6 experiments (ordered by ToM first)
+    1. ToM, No intrinsic (joint rewards, supervised)
+    2. ToM, Intrinsic (separate rewards, supervised)
+    3. ToM, Intrinsic (joint rewards, supervised)
+    4. No ToM, No intrinsic (joint rewards, baseline)
+    5. No ToM, Intrinsic (separate rewards)
+    6. No ToM, Intrinsic (joint rewards)
+    
+    All experiments train with communication enabled and individual parameters.
     """
     import copy
 
     default_config = OmegaConf.to_container(default_config)
 
+    # Define explicit experiment configurations
+    # Order: ToM=True first, then ToM=False
+    # For intrinsic=True: test both separate and joint rewards
+    # For intrinsic=False: only joint rewards (to ensure comm policy gets reward)
+    experiment_configs = [
+        # ToM=True experiments (run first)
+        {"USE_TOM": True, "USE_INTRINSIC_REWARD": False, "USE_SEPARATE_REWARDS": False},  # 1. ToM only
+        {"USE_TOM": True, "USE_INTRINSIC_REWARD": True, "USE_SEPARATE_REWARDS": True},   # 2. ToM + Intr (sep)
+        {"USE_TOM": True, "USE_INTRINSIC_REWARD": True, "USE_SEPARATE_REWARDS": False},  # 3. ToM + Intr (joint)
+        # ToM=False experiments
+        {"USE_TOM": False, "USE_INTRINSIC_REWARD": False, "USE_SEPARATE_REWARDS": False}, # 4. Baseline
+        {"USE_TOM": False, "USE_INTRINSIC_REWARD": True, "USE_SEPARATE_REWARDS": True},  # 5. Intr only (sep)
+        {"USE_TOM": False, "USE_INTRINSIC_REWARD": True, "USE_SEPARATE_REWARDS": False}, # 6. Intr only (joint)
+    ]
+
     sweep_config = {
-        "name": "lgtom_non_ps_architecture_sweep",
+        "name": "lgtom_tom_intrinsic_sweep",
         "method": "grid",  # Try all combinations
         "program": "lgtom_cnn_coins.py",  # The script to run
         "metric": {
@@ -2190,24 +2519,28 @@ def tune(default_config):
             "goal": "maximize",
         },
         "parameters": {
-            # Main sweep parameters for non-parameter-sharing ablation
-            "PARAMETER_SHARING": {"values": [False]},  # Only non-parameter-sharing
-            "USE_SEPARATE_REWARDS": {"values": [True]},  # Separate vs combined training
-            "INFLUENCE_TARGET": {"values": ["belief"]},  # Cosine sim vs KL div
-            "SOCIAL_INFLUENCE_COEFF": {"values": [0,0.1]},  # Fixed coefficient
-            "SEED": {"values": [42,43,44]},  # Fixed seed
+            # Main sweep parameters: ToM, Intrinsic Reward, and Reward Structure
+            # Order by ToM first
+            "USE_TOM": {"values": [True, False]},  # ToM first
+            "USE_INTRINSIC_REWARD": {"values": [False, True]},
+            "USE_SEPARATE_REWARDS": {"values": [False, True]},
             
-            # Fixed settings
-            "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
+            # Fixed parameters
+            "PARAMETER_SHARING": {"values": [False]},  # Individual policies
+            "INFLUENCE_TARGET": {"values": ["belief"]},  # Belief-based influence (cosine sim)
+            "SEED": {"values": [42]},  # Fixed seed
             "USE_COMM": {"values": [True]},  # Always use communication
+            "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
             
-            # Total runs: 1 × 2 × 2 × 1 × 1 = 4 experiments
-            # 
-            # Experiment matrix (non-parameter-sharing only):
-            # - Separate rewards: action/comm separated vs combined
-            # - Influence target: belief (cosine) vs action (KL div)
-            # - Coefficient: 0.1 (all)
-            # - Seed: 42 (all)
+            # Total runs: 6 experiments (filtered in wrapped_make_train)
+            # ToM=True conditions:
+            #   1. ToM, No intrinsic (joint)
+            #   2. ToM, Intrinsic (separate)
+            #   3. ToM, Intrinsic (joint)
+            # ToM=False conditions:
+            #   4. No ToM, No intrinsic (joint, baseline)
+            #   5. No ToM, Intrinsic (separate)
+            #   6. No ToM, Intrinsic (joint)
         },
     }
 
@@ -2226,42 +2559,84 @@ def tune(default_config):
             else:
                 config[k] = v
         
-        # Ensure USE_COMM is always True for this sweep
+        # Get sweep parameters
+        use_intrinsic = config.get("USE_INTRINSIC_REWARD", False)
+        use_tom = config.get("USE_TOM", False)
+        use_separate = config.get("USE_SEPARATE_REWARDS", False)
+        
+        # Filter invalid configurations:
+        # If USE_INTRINSIC_REWARD=False and USE_SEPARATE_REWARDS=True, skip
+        # (comm policy would get zero reward)
+        if not use_intrinsic and use_separate:
+            print(f"Skipping invalid config: USE_INTRINSIC_REWARD=False with USE_SEPARATE_REWARDS=True")
+            wandb.finish()
+            return
+        
+        # Apply conditional settings based on sweep parameters
+        # Set intrinsic coefficient
+        if use_intrinsic:
+            config["SOCIAL_INFLUENCE_COEFF"] = 0.1
+        else:
+            config["SOCIAL_INFLUENCE_COEFF"] = 0.0
+            # Force joint rewards when no intrinsic reward
+            config["USE_SEPARATE_REWARDS"] = False
+        
+        # If USE_TOM=True, enable supervised belief learning from ground truth
+        if use_tom:
+            config["SUPERVISED_BELIEF"] = "ground_truth"
+            config["SUPERVISED_LOSS_COEF"] = 0.1
+        else:
+            config["SUPERVISED_BELIEF"] = "none"
+            config["SUPERVISED_LOSS_COEF"] = 0.0
+        
+        # Ensure fixed settings
         config["USE_COMM"] = True
+        config["PARAMETER_SHARING"] = False
+        config["INFLUENCE_TARGET"] = "belief"
         
-        # Build descriptive run name
-        separate_rewards_str = "sep" if config.get("USE_SEPARATE_REWARDS", True) else "joint"
-        influence_target = config.get("INFLUENCE_TARGET", "belief")
-        influence_coeff = config.get("SOCIAL_INFLUENCE_COEFF", 0.1)
+        # Build descriptive run name (ordered: tom, intrinsic, reward structure)
+        tom_str = "tom" if use_tom else "notom"
+        intrinsic_str = "intr" if use_intrinsic else "nointr"
+        reward_str = "sep" if config["USE_SEPARATE_REWARDS"] else "joint"
+        coeff_str = f"c{config['SOCIAL_INFLUENCE_COEFF']}"
         
-        # Build run name - note these are all non-parameter-sharing runs
-        run_name = f"lgtom_ind_{separate_rewards_str}_{influence_target}_coef{influence_coeff}_s{config['SEED']}"
+        run_name = f"lgtom_{tom_str}_{intrinsic_str}_{reward_str}_{coeff_str}_s{config['SEED']}"
         wandb.run.name = run_name
         
-        # Update tags based on configuration
-        tags = ["LGTOM", "COMM", "IND"]  # All runs are individual (non-PS)
+        # Update tags based on configuration (ordered by ToM first)
+        tags = ["LGTOM", "COMM", "IND", "BELIEF"]
         
-        # Separate rewards tag
-        if config.get("USE_SEPARATE_REWARDS", True):
+        # ToM tag (first priority)
+        if use_tom:
+            tags.append("TOM")
+            tags.append("SUPERVISED_BELIEF")
+        else:
+            tags.append("NO_TOM")
+        
+        # Separate/Joint rewards tag
+        if config["USE_SEPARATE_REWARDS"]:
             tags.append("SEPARATE_REWARDS")
         else:
             tags.append("JOINT_REWARDS")
         
-        # Influence target tag
-        tags.append(f"INFLUENCE_{influence_target.upper()}")
-        
-        # Social influence enabled
-        tags.append("SOCIAL_INFLUENCE")
-        tags.append(f"COEF_{influence_coeff}")
+        # Intrinsic reward tag
+        if use_intrinsic:
+            tags.append("INTRINSIC")
+            tags.append(f"COEF_{config['SOCIAL_INFLUENCE_COEFF']}")
+        else:
+            tags.append("NO_INTRINSIC")
         
         wandb.run.tags = tags
         
         print("="*70)
         print(f"Running experiment: {run_name}")
-        print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', True)}")
+        print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', False)}")
         print(f"  USE_SEPARATE_REWARDS: {config.get('USE_SEPARATE_REWARDS', True)}")
-        print(f"  INFLUENCE_TARGET: {influence_target}")
-        print(f"  SOCIAL_INFLUENCE_COEFF: {influence_coeff}")
+        print(f"  INFLUENCE_TARGET: {config.get('INFLUENCE_TARGET', 'belief')}")
+        print(f"  USE_INTRINSIC_REWARD: {use_intrinsic}")
+        print(f"  SOCIAL_INFLUENCE_COEFF: {config['SOCIAL_INFLUENCE_COEFF']}")
+        print(f"  USE_TOM: {use_tom}")
+        print(f"  SUPERVISED_BELIEF: {config['SUPERVISED_BELIEF']}")
         print(f"  SEED: {config['SEED']}")
         print(f"  Total Timesteps: {config['TOTAL_TIMESTEPS']:.0e}")
         print(f"  Tags: {tags}")
@@ -2297,27 +2672,43 @@ def tune(default_config):
     )
     
     print("\n" + "="*70)
-    print("Starting WandB Sweep: Non-Parameter-Sharing Architecture Ablation")
+    print("Starting WandB Sweep: ToM and Intrinsic Reward Ablation")
     print(f"Sweep ID: {sweep_id}")
     print(f"Total Combinations:")
-    print(f"  - Parameter sharing: 1 (False - individual policies)")
-    print(f"  - Separate rewards: 2 (True, False)")
-    print(f"  - Influence target: 2 (belief, action)")
-    print(f"  - Coefficient: 1 (0.1)")
-    print(f"  - Seed: 1 (42)")
-    print(f"  - Total: 1 × 2 × 2 × 1 × 1 = 4 runs")
+    print(f"  - USE_TOM: 2 (True, False) [ToM first]")
+    print(f"  - USE_INTRINSIC_REWARD: 2 (False, True)")
+    print(f"  - USE_SEPARATE_REWARDS: 2 (False, True)")
+    print(f"  - Valid combinations: 6 runs (2 invalid filtered out)")
     print(f"Timesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
-    print(f"\nExperiment Details:")
-    print(f"  All runs use communication (USE_COMM=True)")
-    print(f"  All runs use individual policies (PARAMETER_SHARING=False)")
-    print(f"  Social influence coefficient fixed at 0.1")
-    print(f"  Individual rewards (not shared)")
-    print(f"  Testing separate vs joint reward training methods")
-    print(f"  Testing belief (cosine) vs action (KL div) influence targets")
+    print(f"\nFixed Settings:")
+    print(f"  - PARAMETER_SHARING: False (individual policies)")
+    print(f"  - INFLUENCE_TARGET: belief (cosine similarity)")
+    print(f"  - SEED: 42")
+    print(f"  - Individual rewards (not shared)")
+    print(f"  - Communication: Enabled")
+    print(f"\nConditional Settings:")
+    print(f"  - If USE_INTRINSIC_REWARD=True:")
+    print(f"      * SOCIAL_INFLUENCE_COEFF=0.1")
+    print(f"      * USE_SEPARATE_REWARDS can be True or False")
+    print(f"  - If USE_INTRINSIC_REWARD=False:")
+    print(f"      * SOCIAL_INFLUENCE_COEFF=0.0")
+    print(f"      * USE_SEPARATE_REWARDS must be False (filtered)")
+    print(f"  - If USE_TOM=True:")
+    print(f"      * SUPERVISED_BELIEF='ground_truth'")
+    print(f"      * SUPERVISED_LOSS_COEF=0.1")
+    print(f"  - If USE_TOM=False:")
+    print(f"      * SUPERVISED_BELIEF='none'")
+    print(f"\nExperiment Matrix (ordered by ToM first):")
+    print(f"  1. ToM, No Intrinsic (joint) - supervised only")
+    print(f"  2. ToM, Intrinsic (separate) - supervised + intrinsic")
+    print(f"  3. ToM, Intrinsic (joint) - supervised + intrinsic")
+    print(f"  4. No ToM, No Intrinsic (joint) - baseline")
+    print(f"  5. No ToM, Intrinsic (separate) - intrinsic only")
+    print(f"  6. No ToM, Intrinsic (joint) - intrinsic only")
     print("="*70 + "\n")
     
-    # Run sweep agent (count=4 for all combinations)
-    wandb.agent(sweep_id, wrapped_make_train, count=4)
+    # Run sweep agent (count=8 but 2 will be filtered, resulting in 6 runs)
+    wandb.agent(sweep_id, wrapped_make_train, count=8)
 
 
 @hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_coins")
