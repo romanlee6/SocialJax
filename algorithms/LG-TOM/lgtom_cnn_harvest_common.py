@@ -823,7 +823,7 @@ def load_offline_llm_dataset(data_path, env_name, config):
     print("WARNING: Offline LLM dataset loading is UNDER CONSTRUCTION")
     print("This feature is not yet fully implemented.")
     print("To use supervised learning from LLM data:")
-    print("  1. Collect LLM trajectories using llms/coins_llm_simulation.py")
+    print("  1. Collect LLM trajectories using llms/harvest_common_llm_simulation.py")
     print("  2. Process and format the data into required structure")
     print("  3. Implement data loading logic in this function")
     print("  4. Set SUPERVISED_COMM or SUPERVISED_BELIEF to 'llm' in config")
@@ -1762,7 +1762,7 @@ def make_train_comm(config):
                 metric = metric[0]
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+
             
             # Log social influence rewards separately if enabled
             if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
@@ -2152,7 +2152,7 @@ def make_train(config):
                 # jax.debug.callback(callback, metric)
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+
             jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, update_step, rng)
@@ -2195,7 +2195,7 @@ def single_run(config):
         tags=tags,
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'{name_suffix}_coins'
+        name=f'{name_suffix}_harvest_common'
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -2292,7 +2292,7 @@ def evaluate_comm(params, env, save_path, config):
     pics = []
     img = env.render(state)
     pics.append(img)
-    root_dir = f"evaluation/coins_comm"
+    root_dir = f"evaluation/harvest_common_comm"
     path = Path(root_dir + "/state_pics")
     path.mkdir(parents=True, exist_ok=True)
 
@@ -2406,7 +2406,7 @@ def evaluate(params, env, save_path, config):
     pics = []
     img = env.render(state)
     pics.append(img)
-    root_dir = f"evaluation/coins"
+    root_dir = f"evaluation/harvest_common"
     path = Path(root_dir + "/state_pics")
     path.mkdir(parents=True, exist_ok=True)
 
@@ -2529,9 +2529,9 @@ def tune(default_config):
     ]
 
     sweep_config = {
-        "name": "lgtom_4conditions_3seeds_sweep",
+        "name": "lgtom_harvest_common_ps_sweep",
         "method": "grid",  # Try all combinations
-        "program": "lgtom_cnn_coins.py",  # The script to run
+        "program": "lgtom_cnn_harvest_common.py",  # The script to run
         "metric": {
             "name": "returned_episode_returns",
             "goal": "maximize",
@@ -2626,7 +2626,7 @@ def tune(default_config):
         reward_str = "sep" if config["USE_SEPARATE_REWARDS"] else "joint"
         coeff_str = f"c{config['SOCIAL_INFLUENCE_COEFF']}"
         
-        run_name = f"lgtom_{tom_str}_{intrinsic_str}_{reward_str}_{coeff_str}_s{config['SEED']}"
+        run_name = f"lgtom_{tom_str}_{intrinsic_str}_ps_{coeff_str}_s{config['SEED']}"
         wandb.run.name = run_name
         
         # Update tags based on configuration (ordered by ToM first)
@@ -2734,7 +2734,7 @@ def tune(default_config):
     wandb.agent(sweep_id, wrapped_make_train, count=8)
 
 
-@hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_coins")
+@hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_harvest_common")
 def main(config):
     if config["TUNE"]:
         tune(config)

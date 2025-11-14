@@ -823,7 +823,7 @@ def load_offline_llm_dataset(data_path, env_name, config):
     print("WARNING: Offline LLM dataset loading is UNDER CONSTRUCTION")
     print("This feature is not yet fully implemented.")
     print("To use supervised learning from LLM data:")
-    print("  1. Collect LLM trajectories using llms/coins_llm_simulation.py")
+    print("  1. Collect LLM trajectories using llms/territory_llm_simulation.py")
     print("  2. Process and format the data into required structure")
     print("  3. Implement data loading logic in this function")
     print("  4. Set SUPERVISED_COMM or SUPERVISED_BELIEF to 'llm' in config")
@@ -1762,7 +1762,7 @@ def make_train_comm(config):
                 metric = metric[0]
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+
             
             # Log social influence rewards separately if enabled
             if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
@@ -2152,7 +2152,7 @@ def make_train(config):
                 # jax.debug.callback(callback, metric)
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+
             jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, update_step, rng)
@@ -2195,7 +2195,7 @@ def single_run(config):
         tags=tags,
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'{name_suffix}_coins'
+        name=f'{name_suffix}_territory'
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -2292,7 +2292,7 @@ def evaluate_comm(params, env, save_path, config):
     pics = []
     img = env.render(state)
     pics.append(img)
-    root_dir = f"evaluation/coins_comm"
+    root_dir = f"evaluation/territory_comm"
     path = Path(root_dir + "/state_pics")
     path.mkdir(parents=True, exist_ok=True)
 
@@ -2406,7 +2406,7 @@ def evaluate(params, env, save_path, config):
     pics = []
     img = env.render(state)
     pics.append(img)
-    root_dir = f"evaluation/coins"
+    root_dir = f"evaluation/territory"
     path = Path(root_dir + "/state_pics")
     path.mkdir(parents=True, exist_ok=True)
 
@@ -2529,9 +2529,9 @@ def tune(default_config):
     ]
 
     sweep_config = {
-        "name": "lgtom_4conditions_3seeds_sweep",
+        "name": "lgtom_territory_sweep",
         "method": "grid",  # Try all combinations
-        "program": "lgtom_cnn_coins.py",  # The script to run
+        "program": "lgtom_cnn_territory_open.py",  # The script to run
         "metric": {
             "name": "returned_episode_returns",
             "goal": "maximize",
@@ -2698,43 +2698,40 @@ def tune(default_config):
     print("Starting WandB Sweep: ToM and Intrinsic Reward Ablation")
     print(f"Sweep ID: {sweep_id}")
     print(f"Total Combinations:")
-    print(f"  - USE_TOM: 2 (True, False) [ToM first]")
-    print(f"  - USE_INTRINSIC_REWARD: 2 (False, True)")
-    print(f"  - USE_SEPARATE_REWARDS: 2 (False, True)")
-    print(f"  - Valid combinations: 6 runs (2 invalid filtered out)")
+    print(f"  - USE_TOM: 2 (True, False)")
+    print(f"  - USE_INTRINSIC_REWARD: 2 (True, False)")
+    print(f"  - USE_SEPARATE_REWARDS: 1 (False only)")
+    print(f"  - SEED: 3 ([68, 123, 456])")
+    print(f"  - Total runs: 4 conditions × 3 seeds = 12 experiments")
     print(f"Timesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
     print(f"\nFixed Settings:")
     print(f"  - PARAMETER_SHARING: False (individual policies)")
     print(f"  - INFLUENCE_TARGET: belief (cosine similarity)")
-    print(f"  - SEED: 42")
+    print(f"  - USE_SEPARATE_REWARDS: False (joint rewards only)")
     print(f"  - Individual rewards (not shared)")
     print(f"  - Communication: Enabled")
     print(f"\nConditional Settings:")
     print(f"  - If USE_INTRINSIC_REWARD=True:")
     print(f"      * SOCIAL_INFLUENCE_COEFF=0.1")
-    print(f"      * USE_SEPARATE_REWARDS can be True or False")
     print(f"  - If USE_INTRINSIC_REWARD=False:")
     print(f"      * SOCIAL_INFLUENCE_COEFF=0.0")
-    print(f"      * USE_SEPARATE_REWARDS must be False (filtered)")
     print(f"  - If USE_TOM=True:")
     print(f"      * SUPERVISED_BELIEF='ground_truth'")
     print(f"      * SUPERVISED_LOSS_COEF=0.1")
     print(f"  - If USE_TOM=False:")
     print(f"      * SUPERVISED_BELIEF='none'")
-    print(f"\nExperiment Matrix (ordered by ToM first):")
-    print(f"  1. ToM, No Intrinsic (joint) - supervised only")
-    print(f"  2. ToM, Intrinsic (separate) - supervised + intrinsic")
-    print(f"  3. ToM, Intrinsic (joint) - supervised + intrinsic")
-    print(f"  4. No ToM, No Intrinsic (joint) - baseline")
-    print(f"  5. No ToM, Intrinsic (separate) - intrinsic only")
-    print(f"  6. No ToM, Intrinsic (joint) - intrinsic only")
+    print(f"\nExperiment Matrix (4 conditions × 3 seeds = 12 runs):")
+    print(f"  1. ToM + Intrinsic + Joint (3 seeds: 68, 123, 456)")
+    print(f"  2. ToM + No Intrinsic + Joint (3 seeds: 68, 123, 456)")
+    print(f"  3. No ToM + Intrinsic + Joint (3 seeds: 68, 123, 456)")
+    print(f"  4. No ToM + No Intrinsic + Joint (3 seeds: 68, 123, 456)")
     print("="*70 + "\n")
     
-    # Run sweep agent (count=8 but 2 will be filtered, resulting in 6 runs)
-    wandb.agent(sweep_id, wrapped_make_train, count=8)
+    # Run sweep agent (4 conditions × 3 seeds = 12 total runs)
+    wandb.agent(sweep_id, wrapped_make_train, count=12)
 
 
-@hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_coins")
+@hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_territory_open")
 def main(config):
     if config["TUNE"]:
         tune(config)

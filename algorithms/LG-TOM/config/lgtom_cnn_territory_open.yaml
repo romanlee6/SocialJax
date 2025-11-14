@@ -1,0 +1,73 @@
+"LR": 0.0005
+"NUM_ENVS": 225
+"NUM_STEPS": 999  # Changed from 1000 to ensure MINIBATCH_SIZE is divisible by num_agents (9) when PARAMETER_SHARING=False
+                   # With NUM_MINIBATCHES=256: MINIBATCH_SIZE = (256 * 1008) / 256 = 1008, which is divisible by 9 ✓
+"TOTAL_TIMESTEPS": 1e7  # Each sweep run will train for 1M timesteps
+"UPDATE_EPOCHS": 2
+"NUM_MINIBATCHES": 225  # Must evenly divide NUM_ACTORS * NUM_STEPS; MINIBATCH_SIZE must be divisible by num_agents (9) when USE_TOM=True
+                        # When PARAMETER_SHARING=True: NUM_ACTORS = 9*256 = 2304, MINIBATCH_SIZE = (2304 * 1008) / 256 = 9072, divisible by 9 ✓
+                        # When PARAMETER_SHARING=False: NUM_ACTORS = 256, MINIBATCH_SIZE = (256 * 1008) / 256 = 1008, divisible by 9 ✓
+                        # Alternative NUM_STEPS values: 999, 1008 (also divisible by 9)
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"ENT_COEF": 0.01
+"VF_COEF": 0.5
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ENV_NAME": "territory_open"
+"REW_SHAPING_HORIZON": 2.5e6 # for how many timesteps add a shaping reward
+"SHAPING_BEGIN": 1e6
+"ENV_KWARGS": 
+  "num_agents" : 9
+  "num_inner_steps" : 999
+  "shared_rewards" : False # Attention: switch to False for individual rewards 
+  "cnn" : True
+  "jit" : True
+  
+
+"ANNEAL_LR": True
+"SEED": 42  # Default seed (will be overridden by sweep when TUNE=True)
+"NUM_SEEDS": 1
+"TUNE": False  # Set to True to run non-PS ablation sweep (4 runs: 2×2 for SepReward×InfluenceTarget)
+
+"REWARD": "individual" # individual; common
+"GIF_NUM_FRAMES": 250  # Should be <= num_inner_steps (episode length)
+"PARAMETER_SHARING": True  # Recommended True for communication; False for independent agents
+
+# Communication Parameters
+"USE_COMM": True  # Set to True to use communication architecture
+"COMM_DIM": 64  # Dimension of communication vectors (must match with hidden_dim - embedding_dim)
+"NUM_PROTOS": 10  # Number of prototype communication symbols
+"HIDDEN_DIM": 128  # Hidden dimension for GRU (must be embedding_dim + comm_dim = 64 + 64)
+"COMM_MODE": "avg"  # Communication aggregation mode: 'avg' or 'sum'
+
+# Theory of Mind (ToM) Parameters
+"USE_TOM": False  # Enable Theory of Mind prediction model
+"SUPERVISED_BELIEF": "none"  # Supervised belief training: "none", "ground_truth", or "llm"
+"SUPERVISED_COMM": "none"  # Supervised communication training: "none", "ground_truth", or "llm"
+"SUPERVISED_LOSS_COEF": 0.1  # Weight for supervised learning loss
+"LLM_DATA_PATH": ""  # Path to offline LLM dataset (*** UNDER CONSTRUCTION ***)
+# NOTE: When USE_TOM=True, supervised loss is ALWAYS backpropagated (if SUPERVISED_BELIEF != "none")
+# LOSS FUNCTION: Uses cosine similarity loss (1 - cos_sim) for both belief and communication
+#   - Belief supervision: ToM prediction vs other agents' actual belief states
+#   - Comm supervision: Communication vectors similarity across agents (encourages alignment)
+
+# Intrinsic Reward Parameters
+"USE_INTRINSIC_REWARD": False  # Enable intrinsic reward calculation (can be used with or without ToM)
+"SOCIAL_INFLUENCE_COEFF": 0.1  # Coefficient for social influence intrinsic reward
+"INFLUENCE_TARGET": "belief"  # What to measure influence on: "action" (KL div) or "belief" (cosine sim)
+"USE_SEPARATE_REWARDS": True  # Train action and comm heads with separate rewards
+"COMM_LOSS_COEF": 0.1  # Weight for communication policy loss
+# NOTE: Interaction between ToM and Intrinsic Reward:
+#   - If USE_INTRINSIC_REWARD=True AND USE_TOM=True: Uses ToM predictions in counterfactuals (efficient)
+#   - If USE_INTRINSIC_REWARD=True AND USE_TOM=False: Uses ground truth beliefs in influence calculation
+#   - Both modes work with PARAMETER_SHARING=True/False and USE_SEPARATE_REWARDS=True/False
+
+# WandB Params
+"ENTITY": ""
+"PROJECT": "socialjax"
+"WANDB_MODE" : "online"
+"WANDB_TAGS":
+  - INDIVIDUAL_REWARD # COMMON_REWARD
+  - LGTOM_COMM
