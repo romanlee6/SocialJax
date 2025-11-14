@@ -2546,7 +2546,7 @@ def tune(default_config):
             "SEED": {"values": [68, 123, 456]},  # 3 different random seeds
             
             # Fixed parameters
-            "PARAMETER_SHARING": {"values": [False]},  # Individual policies
+            "PARAMETER_SHARING": {"values": [True]},  # Individual policies
             "INFLUENCE_TARGET": {"values": ["belief"]},  # Belief-based influence (cosine sim)
             "USE_COMM": {"values": [True]},  # Always use communication
             "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
