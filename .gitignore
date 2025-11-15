@@ -5,4 +5,5 @@ wandb/
 checkpoints/
 llms/llm_benchmarks/
 llms/llm_simulation_output/
+llm_simulation_output/
 *.pickle
