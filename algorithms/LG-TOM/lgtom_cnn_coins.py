@@ -1671,11 +1671,18 @@ def make_train_comm(config):
                     
                     rng, _rng = jax.random.split(update_state[-1])
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
+                    (total_loss, loss_components), grads = grad_fn(
                         train_state.params, traj_batch, action_adv, comm_adv, targets, network_used, _rng
                     )
+                    # Extract individual loss components from the aux output
+                    # loss_components = (value_loss, loss_actor, loss_comm, entropy, comm_entropy, supervised_loss)
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    # Return loss components for logging
+                    if loss_components is not None and len(loss_components) >= 6:
+                        _, _, loss_comm_val, _, _, supervised_loss_val = loss_components
+                        return train_state, (total_loss, loss_comm_val, supervised_loss_val)
+                    else:
+                        return train_state, (total_loss, 0.0, 0.0)
                 
                 train_state, traj_batch, action_adv, comm_adv, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
@@ -1699,16 +1706,21 @@ def make_train_comm(config):
                 )
                 
                 if config.get("PARAMETER_SHARING", True):
-                    train_state, total_loss = jax.lax.scan(
+                    train_state, loss_info = jax.lax.scan(
                         lambda state, batch_info: _update_minbatch(state, batch_info, network), train_state, minibatches
                     )
                 else:
-                    train_state, total_loss = jax.lax.scan(
+                    train_state, loss_info = jax.lax.scan(
                         lambda state, batch_info: _update_minbatch(state, batch_info, network[i]), train_state, minibatches
                     )
                 
+                # Extract and average loss components across minibatches
+                total_loss = loss_info[0].mean() if isinstance(loss_info, tuple) else loss_info.mean()
+                loss_comm_avg = loss_info[1].mean() if isinstance(loss_info, tuple) else 0.0
+                supervised_loss_avg = loss_info[2].mean() if isinstance(loss_info, tuple) else 0.0
+                
                 update_state = (train_state, traj_batch, action_adv, comm_adv, targets, rng)
-                return update_state, total_loss
+                return update_state, (total_loss, loss_comm_avg, supervised_loss_avg)
             
             if config.get("PARAMETER_SHARING", True):
                 update_state = (train_state, traj_batch, action_advantages, comm_advantages, targets, rng)
@@ -1717,6 +1729,13 @@ def make_train_comm(config):
                 )
                 train_state = update_state[0]
                 metric = traj_batch.info
+                # Extract loss components averaged across epochs
+                if isinstance(loss_info, tuple) and len(loss_info) >= 3:
+                    metric['loss'] = loss_info[0].mean()
+                    metric['comm_loss'] = loss_info[1].mean()
+                    metric['supervised_loss'] = loss_info[2].mean()
+                else:
+                    metric['loss'] = loss_info[0].mean() if isinstance(loss_info, tuple) else loss_info.mean()
                 rng = update_state[-1]
             else:
                 update_state_dict = []
@@ -1729,7 +1748,12 @@ def make_train_comm(config):
                     update_state_dict.append(update_state)
                     train_state[i] = update_state[0]
                     metric_i = traj_batch[i].info
-                    metric_i['loss'] = loss_info[0]
+                    if isinstance(loss_info, tuple) and len(loss_info) >= 3:
+                        metric_i['loss'] = loss_info[0].mean()
+                        metric_i['comm_loss'] = loss_info[1].mean()
+                        metric_i['supervised_loss'] = loss_info[2].mean()
+                    else:
+                        metric_i['loss'] = loss_info[0].mean() if isinstance(loss_info, tuple) else loss_info.mean()
                     metric.append(metric_i)
                     rng = update_state[-1]
             
@@ -1769,7 +1793,9 @@ def make_train_comm(config):
                 try:
                     if "social_influence_reward" in metric:
                         # Convert to Python scalar for WandB
-                        metric["intrinsic_reward/social_influence"] = metric["social_influence_reward"]
+                        intrinsic_reward_val = metric["social_influence_reward"]
+                        metric["intrinsic_reward/social_influence"] = intrinsic_reward_val
+                        metric["intrinsic_reward"] = intrinsic_reward_val  # Also log as intrinsic_reward
                     if "env_reward_only" in metric:
                         # Convert to Python scalar for WandB
                         metric["extrinsic_reward/environment"] = metric["env_reward_only"]
@@ -1779,6 +1805,16 @@ def make_train_comm(config):
                 except (KeyError, TypeError) as e:
                     # If metrics don't exist yet or can't be converted, skip logging them
                     pass
+            
+            # Log supervised_loss and comm_loss if available
+            try:
+                if "supervised_loss" in metric:
+                    metric["supervised_loss"] = float(metric["supervised_loss"])
+                if "comm_loss" in metric:
+                    metric["comm_loss"] = float(metric["comm_loss"])
+            except (KeyError, TypeError) as e:
+                # If metrics don't exist yet or can't be converted, skip logging them
+                pass
             
             # Log all coefficient values for hyperparameter sweep analysis
             try:
@@ -2530,9 +2566,9 @@ def tune(default_config):
             "USE_TOM": {"values": [True]},  # Enable ToM for supervised loss
             "USE_INTRINSIC_REWARD": {"values": [True]},  # Enable intrinsic reward
             "USE_COMM": {"values": [True]},  # Always use communication
-            "PARAMETER_SHARING": {"values": [True]},  # Parameter sharing enabled
+            "PARAMETER_SHARING": {"values": [False]},  # Parameter sharing enabled
             "SUPERVISED_BELIEF": {"values": ["ground_truth"]},  # Supervised learning enabled
-            "USE_SEPARATE_REWARDS": {"values": [True]},  # Separate rewards
+            "USE_SEPARATE_REWARDS": {"values": [False]},  # Separate rewards
             "INFLUENCE_TARGET": {"values": ["belief"]},  # Belief-based influence
             "SEED": {"values": [42]},  # Single seed for sweep (can be extended)
             "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
@@ -2570,9 +2606,9 @@ def tune(default_config):
         config["USE_COMM"] = True
         config["USE_TOM"] = True
         config["USE_INTRINSIC_REWARD"] = True
-        config["PARAMETER_SHARING"] = True
+        config["PARAMETER_SHARING"] = False
         config["SUPERVISED_BELIEF"] = "ground_truth"
-        config["USE_SEPARATE_REWARDS"] = True
+        config["USE_SEPARATE_REWARDS"] = False
         config["INFLUENCE_TARGET"] = "belief"
         
         # Build descriptive run name with coefficient values
@@ -2581,7 +2617,7 @@ def tune(default_config):
         wandb.run.name = run_name
         
         # Update tags based on configuration
-        tags = ["LGTOM", "COMM", "PS", "BELIEF", "COEFFICIENT_SWEEP", "SEPARATE_REWARDS"]
+        tags = ["LGTOM", "COMM", "IND", "BELIEF", "COEFFICIENT_SWEEP", "JOINT_REWARDS"]
         tags.append("TOM")
         tags.append("INTRINSIC")
         tags.append(f"SUP_COEF_{supervised_coef}")
