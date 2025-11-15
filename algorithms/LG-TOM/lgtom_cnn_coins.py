@@ -1780,6 +1780,15 @@ def make_train_comm(config):
                     # If metrics don't exist yet or can't be converted, skip logging them
                     pass
             
+            # Log all coefficient values for hyperparameter sweep analysis
+            try:
+                metric["hyperparameters/supervised_loss_coef"] = float(config.get("SUPERVISED_LOSS_COEF", 1.0))
+                metric["hyperparameters/comm_loss_coef"] = float(config.get("COMM_LOSS_COEF", 1.0))
+                metric["hyperparameters/social_influence_coeff"] = float(config.get("SOCIAL_INFLUENCE_COEFF", 0.0))
+            except (KeyError, TypeError) as e:
+                # If config values don't exist, skip logging them
+                pass
+            
             jax.debug.callback(callback, metric)
             
             runner_state = (train_state, env_state, last_obs, hidden_states, prev_comm, update_step, rng)
@@ -2478,58 +2487,33 @@ def evaluate(params, env, save_path, config):
 
 def tune(default_config):
     """
-    Hyperparameter sweep with wandb for ToM and Intrinsic Reward experiments.
+    Hyperparameter sweep with wandb for coefficient experiments.
     
-    Experiments (NON-PARAMETER-SHARING ONLY):
-    - Parameter sharing: False (individual policies)
-    - Influence target: belief (cosine similarity)
-    - Seeds: [42, 123, 456] (3 different random seeds)
-    - Individual rewards (not shared)
-    - Joint rewards only (USE_SEPARATE_REWARDS: False)
+    Sweeps over:
+    - SUPERVISED_LOSS_COEF: [0.1, 1.0]
+    - COMM_LOSS_COEF: [0.1, 1.0]
+    - SOCIAL_INFLUENCE_COEFF: [0.1, 1.0]
     
-    Current sweep: 4 conditions × 3 seeds = 12 total runs
+    Total combinations: 2 × 2 × 2 = 8 runs
     
-    Conditions:
-    1. ToM + Intrinsic + Joint (supervised on ground truth)
-       - USE_TOM: True, USE_INTRINSIC_REWARD: True
-       - SUPERVISED_BELIEF: "ground_truth", SOCIAL_INFLUENCE_COEFF: 0.1
-    
-    2. No ToM + Intrinsic + Joint (using ground truth belief directly)
-       - USE_TOM: False, USE_INTRINSIC_REWARD: True
-       - Uses ground truth beliefs for counterfactuals, SOCIAL_INFLUENCE_COEFF: 0.1
-    
-    3. ToM + No Intrinsic + Joint (supervised on ground truth)
-       - USE_TOM: True, USE_INTRINSIC_REWARD: False
-       - SUPERVISED_BELIEF: "ground_truth", SOCIAL_INFLUENCE_COEFF: 0.0
-    
-    4. No ToM + No Intrinsic + Joint (baseline)
-       - USE_TOM: False, USE_INTRINSIC_REWARD: False
-       - SOCIAL_INFLUENCE_COEFF: 0.0
-    
-    All experiments train with communication enabled and individual parameters.
+    Fixed settings:
+    - USE_TOM: True (enabled for supervised loss)
+    - USE_INTRINSIC_REWARD: True (enabled for social influence)
+    - USE_COMM: True (communication enabled)
+    - PARAMETER_SHARING: True (parameter sharing enabled)
+    - SUPERVISED_BELIEF: "ground_truth" (supervised learning enabled)
+    - USE_SEPARATE_REWARDS: True (separate rewards for action and comm)
+    - INFLUENCE_TARGET: "belief" (belief-based influence)
     """
     import copy
 
     default_config = OmegaConf.to_container(default_config)
 
-    # Define explicit experiment configurations
-    # 4 conditions × 3 seeds = 12 total experiments
-    experiment_configs = [
-        # Condition 1: ToM + Intrinsic + Joint
-        {"USE_TOM": True, "USE_INTRINSIC_REWARD": True, "USE_SEPARATE_REWARDS": False},
-        
-        # Condition 2: No ToM + Intrinsic + Joint  
-        {"USE_TOM": False, "USE_INTRINSIC_REWARD": True, "USE_SEPARATE_REWARDS": False},
-        
-        # Condition 3: ToM + No Intrinsic + Joint
-        {"USE_TOM": True, "USE_INTRINSIC_REWARD": False, "USE_SEPARATE_REWARDS": False},
-        
-        # Condition 4: No ToM + No Intrinsic + Joint (baseline)
-        {"USE_TOM": False, "USE_INTRINSIC_REWARD": False, "USE_SEPARATE_REWARDS": False},
-    ]
+    # Define coefficient values to sweep over [0.1, 1]
+    coefficient_values = [0.1, 1.0]
 
     sweep_config = {
-        "name": "lgtom_4conditions_3seeds_sweep",
+        "name": "lgtom_coefficient_sweep",
         "method": "grid",  # Try all combinations
         "program": "lgtom_cnn_coins.py",  # The script to run
         "metric": {
@@ -2537,25 +2521,23 @@ def tune(default_config):
             "goal": "maximize",
         },
         "parameters": {
-            # Main sweep parameters: 4 conditions × 3 seeds
-            "USE_TOM": {"values": [True, False]},  # ToM vs No ToM
-            "USE_INTRINSIC_REWARD": {"values": [True, False]},  # Intrinsic vs No Intrinsic
-            "USE_SEPARATE_REWARDS": {"values": [False]},  # Joint rewards only
-            
-            # Multiple seeds for reproducibility
-            "SEED": {"values": [68, 123, 456]},  # 3 different random seeds
+            # Main sweep parameters: coefficient values
+            "SUPERVISED_LOSS_COEF": {"values": coefficient_values},
+            "COMM_LOSS_COEF": {"values": coefficient_values},
+            "SOCIAL_INFLUENCE_COEFF": {"values": coefficient_values},
             
             # Fixed parameters
-            "PARAMETER_SHARING": {"values": [False]},  # Individual policies
-            "INFLUENCE_TARGET": {"values": ["belief"]},  # Belief-based influence (cosine sim)
+            "USE_TOM": {"values": [True]},  # Enable ToM for supervised loss
+            "USE_INTRINSIC_REWARD": {"values": [True]},  # Enable intrinsic reward
             "USE_COMM": {"values": [True]},  # Always use communication
+            "PARAMETER_SHARING": {"values": [True]},  # Parameter sharing enabled
+            "SUPERVISED_BELIEF": {"values": ["ground_truth"]},  # Supervised learning enabled
+            "USE_SEPARATE_REWARDS": {"values": [True]},  # Separate rewards
+            "INFLUENCE_TARGET": {"values": ["belief"]},  # Belief-based influence
+            "SEED": {"values": [42]},  # Single seed for sweep (can be extended)
             "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
             
-            # Total runs: 4 conditions × 3 seeds = 12 experiments
-            #   Condition 1: ToM + Intrinsic + Joint (3 seeds)
-            #   Condition 2: No ToM + Intrinsic + Joint (3 seeds)
-            #   Condition 3: ToM + No Intrinsic + Joint (3 seeds)
-            #   Condition 4: No ToM + No Intrinsic + Joint (3 seeds)
+            # Total runs: 2 × 2 × 2 = 8 experiments
         },
     }
 
@@ -2574,92 +2556,58 @@ def tune(default_config):
             else:
                 config[k] = v
         
-        # Get sweep parameters
-        use_intrinsic = config.get("USE_INTRINSIC_REWARD", False)
-        use_tom = config.get("USE_TOM", False)
-        use_separate = config.get("USE_SEPARATE_REWARDS", False)
+        # Get sweep parameters (coefficients are set directly from wandb.config)
+        supervised_coef = config.get("SUPERVISED_LOSS_COEF", 1.0)
+        comm_coef = config.get("COMM_LOSS_COEF", 1.0)
+        social_influence_coef = config.get("SOCIAL_INFLUENCE_COEFF", 0.1)
         
-        # No filtering needed - grid sweep generates exactly 4 conditions × 3 seeds = 12 runs:
-        # 1. ToM + Intrinsic + Joint
-        # 2. No ToM + Intrinsic + Joint  
-        # 3. ToM + No Intrinsic + Joint
-        # 4. No ToM + No Intrinsic + Joint
-        # All combinations are valid
-        
-        # Apply conditional settings based on sweep parameters
-        # Set intrinsic coefficient
-        if use_intrinsic:
-            config["SOCIAL_INFLUENCE_COEFF"] = 0.1
-        else:
-            config["SOCIAL_INFLUENCE_COEFF"] = 0.0
-            # Force joint rewards when no intrinsic reward
-            config["USE_SEPARATE_REWARDS"] = False
-        
-        # Configure ToM and belief supervision
-        if use_tom:
-            # Condition 1 or 3: ToM enabled - supervise belief learning from ground truth
-            config["SUPERVISED_BELIEF"] = "ground_truth"
-            config["SUPERVISED_LOSS_COEF"] = 0.1
-        else:
-            # Condition 2 or 4: No ToM
-            config["SUPERVISED_BELIEF"] = "none"
-            config["SUPERVISED_LOSS_COEF"] = 0.0
-            
-            # # Special handling for Condition 2 (No ToM + Intrinsic):
-            # # Use ground truth beliefs directly in counterfactuals
-            # # When USE_TOM=False, tom_pred is None, so counterfactuals automatically
-            # # use belief_cf (actual belief states) which are trained with supervision
-            # # to match ground truth when intrinsic reward is enabled
-            # if use_intrinsic:
-            #     # Enable belief supervision even without ToM for condition 2
-            #     config["SUPERVISED_BELIEF"] = "ground_truth"
-            #     config["SUPERVISED_LOSS_COEF"] = 0.1
+        # Ensure coefficients are set correctly
+        config["SUPERVISED_LOSS_COEF"] = supervised_coef
+        config["COMM_LOSS_COEF"] = comm_coef
+        config["SOCIAL_INFLUENCE_COEFF"] = social_influence_coef
         
         # Ensure fixed settings
         config["USE_COMM"] = True
-        config["PARAMETER_SHARING"] = False
+        config["USE_TOM"] = True
+        config["USE_INTRINSIC_REWARD"] = True
+        config["PARAMETER_SHARING"] = True
+        config["SUPERVISED_BELIEF"] = "ground_truth"
+        config["USE_SEPARATE_REWARDS"] = True
         config["INFLUENCE_TARGET"] = "belief"
         
-        # Build descriptive run name (ordered: tom, intrinsic, reward structure)
-        tom_str = "tom" if use_tom else "notom"
-        intrinsic_str = "intr" if use_intrinsic else "nointr"
-        reward_str = "sep" if config["USE_SEPARATE_REWARDS"] else "joint"
-        coeff_str = f"c{config['SOCIAL_INFLUENCE_COEFF']}"
-        
-        run_name = f"lgtom_{tom_str}_{intrinsic_str}_{reward_str}_{coeff_str}_s{config['SEED']}"
+        # Build descriptive run name with coefficient values
+        run_name = (f"lgtom_coef_sup{supervised_coef}_comm{comm_coef}_"
+                   f"inf{social_influence_coef}_s{config['SEED']}")
         wandb.run.name = run_name
         
-        # Update tags based on configuration (ordered by ToM first)
-        tags = ["LGTOM", "COMM", "IND", "BELIEF", "JOINT_REWARDS"]
-        
-        # ToM tag (first priority)
-        if use_tom:
-            tags.append("TOM")
-            tags.append("SUPERVISED_BELIEF")
-        else:
-            tags.append("NO_TOM")
-            # Add tag if beliefs are supervised even without ToM (condition 2)
-            if use_intrinsic:
-                tags.append("SUPERVISED_BELIEF")
-        
-        # Intrinsic reward tag
-        if use_intrinsic:
-            tags.append("INTRINSIC")
-            tags.append(f"COEF_{config['SOCIAL_INFLUENCE_COEFF']}")
-        else:
-            tags.append("NO_INTRINSIC")
+        # Update tags based on configuration
+        tags = ["LGTOM", "COMM", "PS", "BELIEF", "COEFFICIENT_SWEEP", "SEPARATE_REWARDS"]
+        tags.append("TOM")
+        tags.append("INTRINSIC")
+        tags.append(f"SUP_COEF_{supervised_coef}")
+        tags.append(f"COMM_COEF_{comm_coef}")
+        tags.append(f"INF_COEF_{social_influence_coef}")
         
         wandb.run.tags = tags
         
+        # Log coefficient values to wandb config for easy filtering
+        wandb.config.update({
+            "SUPERVISED_LOSS_COEF": supervised_coef,
+            "COMM_LOSS_COEF": comm_coef,
+            "SOCIAL_INFLUENCE_COEFF": social_influence_coef,
+        })
+        
         print("="*70)
-        print(f"Running experiment: {run_name}")
-        print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', False)}")
+        print(f"Running coefficient sweep experiment: {run_name}")
+        print(f"  SUPERVISED_LOSS_COEF: {supervised_coef}")
+        print(f"  COMM_LOSS_COEF: {comm_coef}")
+        print(f"  SOCIAL_INFLUENCE_COEFF: {social_influence_coef}")
+        print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', True)}")
         print(f"  USE_SEPARATE_REWARDS: {config.get('USE_SEPARATE_REWARDS', True)}")
         print(f"  INFLUENCE_TARGET: {config.get('INFLUENCE_TARGET', 'belief')}")
-        print(f"  USE_INTRINSIC_REWARD: {use_intrinsic}")
-        print(f"  SOCIAL_INFLUENCE_COEFF: {config['SOCIAL_INFLUENCE_COEFF']}")
-        print(f"  USE_TOM: {use_tom}")
-        print(f"  SUPERVISED_BELIEF: {config['SUPERVISED_BELIEF']}")
+        print(f"  USE_INTRINSIC_REWARD: {config.get('USE_INTRINSIC_REWARD', True)}")
+        print(f"  USE_TOM: {config.get('USE_TOM', True)}")
+        print(f"  SUPERVISED_BELIEF: {config.get('SUPERVISED_BELIEF', 'ground_truth')}")
         print(f"  SEED: {config['SEED']}")
         print(f"  Total Timesteps: {config['TOTAL_TIMESTEPS']:.0e}")
         print(f"  Tags: {tags}")
@@ -2694,44 +2642,36 @@ def tune(default_config):
         sweep_config, entity=default_config["ENTITY"], project=default_config["PROJECT"]
     )
     
+    num_coef_values = len(coefficient_values)
+    total_runs = num_coef_values ** 3
+    
     print("\n" + "="*70)
-    print("Starting WandB Sweep: ToM and Intrinsic Reward Ablation")
+    print("Starting WandB Sweep: Coefficient Hyperparameter Sweep")
     print(f"Sweep ID: {sweep_id}")
     print(f"Total Combinations:")
-    print(f"  - USE_TOM: 2 (True, False) [ToM first]")
-    print(f"  - USE_INTRINSIC_REWARD: 2 (False, True)")
-    print(f"  - USE_SEPARATE_REWARDS: 2 (False, True)")
-    print(f"  - Valid combinations: 6 runs (2 invalid filtered out)")
+    print(f"  - SUPERVISED_LOSS_COEF: {num_coef_values} values {coefficient_values}")
+    print(f"  - COMM_LOSS_COEF: {num_coef_values} values {coefficient_values}")
+    print(f"  - SOCIAL_INFLUENCE_COEFF: {num_coef_values} values {coefficient_values}")
+    print(f"  - Total runs: {total_runs} ({num_coef_values}³)")
     print(f"Timesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
     print(f"\nFixed Settings:")
-    print(f"  - PARAMETER_SHARING: False (individual policies)")
-    print(f"  - INFLUENCE_TARGET: belief (cosine similarity)")
-    print(f"  - SEED: 42")
+    print(f"  - USE_TOM: True (enabled for supervised loss)")
+    print(f"  - USE_INTRINSIC_REWARD: True (enabled for social influence)")
+    print(f"  - USE_COMM: True (communication enabled)")
+    print(f"  - PARAMETER_SHARING: True (parameter sharing enabled)")
+    print(f"  - SUPERVISED_BELIEF: 'ground_truth' (supervised learning enabled)")
+    print(f"  - USE_SEPARATE_REWARDS: True (separate rewards for action and comm)")
+    print(f"  - INFLUENCE_TARGET: 'belief' (belief-based influence)")
+    print(f"  - SEED: {default_config.get('SEED', 42)}")
     print(f"  - Individual rewards (not shared)")
-    print(f"  - Communication: Enabled")
-    print(f"\nConditional Settings:")
-    print(f"  - If USE_INTRINSIC_REWARD=True:")
-    print(f"      * SOCIAL_INFLUENCE_COEFF=0.1")
-    print(f"      * USE_SEPARATE_REWARDS can be True or False")
-    print(f"  - If USE_INTRINSIC_REWARD=False:")
-    print(f"      * SOCIAL_INFLUENCE_COEFF=0.0")
-    print(f"      * USE_SEPARATE_REWARDS must be False (filtered)")
-    print(f"  - If USE_TOM=True:")
-    print(f"      * SUPERVISED_BELIEF='ground_truth'")
-    print(f"      * SUPERVISED_LOSS_COEF=0.1")
-    print(f"  - If USE_TOM=False:")
-    print(f"      * SUPERVISED_BELIEF='none'")
-    print(f"\nExperiment Matrix (ordered by ToM first):")
-    print(f"  1. ToM, No Intrinsic (joint) - supervised only")
-    print(f"  2. ToM, Intrinsic (separate) - supervised + intrinsic")
-    print(f"  3. ToM, Intrinsic (joint) - supervised + intrinsic")
-    print(f"  4. No ToM, No Intrinsic (joint) - baseline")
-    print(f"  5. No ToM, Intrinsic (separate) - intrinsic only")
-    print(f"  6. No ToM, Intrinsic (joint) - intrinsic only")
+    print(f"\nSweep Parameters:")
+    print(f"  - Coefficient range: [0.1, 1.0]")
+    print(f"  - Coefficient values: {coefficient_values}")
+    print(f"  - All coefficients will be logged to WandB for analysis")
     print("="*70 + "\n")
     
-    # Run sweep agent (count=8 but 2 will be filtered, resulting in 6 runs)
-    wandb.agent(sweep_id, wrapped_make_train, count=8)
+    # Run sweep agent for all combinations
+    wandb.agent(sweep_id, wrapped_make_train, count=total_runs)
 
 
 @hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_coins")

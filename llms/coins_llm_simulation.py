@@ -1233,22 +1233,33 @@ class Visualizer:
 # ============================================================================
 
 def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output",
-                  model: str = "gpt-5-mini", temperature: float = 0.7,
-                  seed: int = 42):
+                  model: str = "gpt-5.1", temperature: float = 0.7,
+                  seed: int = 42, reasoning: str = "medium"):
     """
     Run LLM agent simulation in coins game.
     
     Args:
         num_steps: Number of timesteps to simulate
         save_dir: Directory to save visualizations
-        model: Model name to use (e.g., "gpt-5-mini", "gpt-4")
+        model: Model name to use (e.g., "gpt-5.1", "gpt-5-mini", "o3")
         temperature: Sampling temperature for LLM (0.0-2.0)
         seed: Random seed for environment
+        reasoning: Reasoning effort level for GPT-5.1 ("low", "medium", "high", or None for default)
     """
     
-    # Check if API key is set
-    if not os.getenv("OPENAI_API_KEY"):
-        raise ValueError("OPENAI_API_KEY environment variable not set. Please set it before running.")
+    # Check API keys based on model
+    if model == "gpt-5.1":
+        gpt51_url = os.getenv("GPT_51_URL")
+        gpt51_key = os.getenv("GPT_51_KEY")
+        if not gpt51_url or not gpt51_key:
+            raise ValueError(
+                "GPT-5.1 requires GPT_51_URL and GPT_51_KEY environment variables. "
+                f"GPT_51_URL={'set' if gpt51_url else 'NOT SET'}, "
+                f"GPT_51_KEY={'set' if gpt51_key else 'NOT SET'}"
+            )
+    else:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY environment variable not set. Please set it before running.")
     
     # Initialize environment
     env = CoinGame(
@@ -1263,9 +1274,9 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     # Initialize agents
     agents = [
         LLMAgent(agent_id=0, team_color="red", model=model, 
-                temperature=temperature),
+                temperature=temperature, reasoning=reasoning),
         LLMAgent(agent_id=1, team_color="green", model=model,
-                temperature=temperature)
+                temperature=temperature, reasoning=reasoning)
     ]
     
     # Initialize communication manager
@@ -1274,8 +1285,14 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     # Initialize OpenAI client for embeddings
     embedding_client = OpenAI()
     
+    # Create display name for logging (include reasoning if specified)
+    if model == "gpt-5.1" and reasoning and reasoning != "none":
+        model_display_name = f"{model}_reasoning-{reasoning}"
+    else:
+        model_display_name = model
+    
     # Initialize trajectory logger (will create experiment subfolder)
-    logger = TrajectoryLogger(save_dir, model, temperature, seed, num_agents=2, embedding_client=embedding_client)
+    logger = TrajectoryLogger(save_dir, model_display_name, temperature, seed, num_agents=2, embedding_client=embedding_client)
     
     # Update save_dir to point to the experiment subfolder for visualizations
     save_dir = logger.save_dir
@@ -1449,8 +1466,11 @@ if __name__ == "__main__":
                        help="Number of timesteps to simulate (default: 1000)")
     parser.add_argument("--output-dir", type=str, default="./llm_simulation_output",
                        help="Directory to save visualizations (default: ./llm_simulation_output)")
-    parser.add_argument("--model", type=str, default="o3",
-                       help="Model name to use (default: o3)")
+    parser.add_argument("--model", type=str, default="gpt-5.1",
+                       help="Model name to use (default: gpt-5.1)")
+    parser.add_argument("--reasoning", type=str, default="medium",
+                       choices=["low", "medium", "high", "none"],
+                       help="Reasoning effort level for GPT-5.1 (default: medium)")
     parser.add_argument("--temperature", type=float, default=0.0,
                        help="Sampling temperature 0.0-2.0 (default: 0.0)")
     parser.add_argument("--seed", type=int, default=None,
@@ -1464,6 +1484,8 @@ if __name__ == "__main__":
     print("LLM Agent Simulation for Coins Game")
     print("=" * 70)
     print(f"Model: {args.model}")
+    if args.model == "gpt-5.1":
+        print(f"Reasoning: {args.reasoning}")
     print(f"Temperature: {args.temperature}")
     print(f"Steps per run: {args.steps}")
     print(f"Number of runs: {args.num_runs}")
@@ -1478,11 +1500,12 @@ if __name__ == "__main__":
             save_dir=args.output_dir,
             model=args.model,
             temperature=args.temperature,
-            seed=args.seed
+            seed=args.seed,
+            reasoning=args.reasoning if args.model == "gpt-5.1" else None
         )
     else:
         # Multiple runs with different seeds
-        seeds = list(range(42, 42 + args.num_runs))
+        seeds = list(range(1, 1 + args.num_runs))
         for i, seed in enumerate(seeds):
             print(f"\n{'='*70}")
             print(f"Run {i+1}/{args.num_runs} with seed {seed}")
@@ -1492,6 +1515,7 @@ if __name__ == "__main__":
                 save_dir=args.output_dir,
                 model=args.model,
                 temperature=args.temperature,
-                seed=seed
+                seed=seed,
+                reasoning=args.reasoning if args.model == "gpt-5.1" else None
             )
 

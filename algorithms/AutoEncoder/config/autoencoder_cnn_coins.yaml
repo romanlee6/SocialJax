@@ -39,9 +39,9 @@
 "COMM_MODE": "avg"  # Communication aggregation mode: 'avg' or 'sum'
 
 # AutoEncoder Parameters
-"AUTOENCODER_LOSS_COEF": 0.1  # Weight for autoencoder reconstruction loss (MSE between original and reconstructed embeddings)
+"AUTOENCODER_LOSS_COEF": 1  # Weight for autoencoder reconstruction loss (MSE between original and reconstructed embeddings)
 "USE_SEPARATE_REWARDS": False  # Autoencoder uses same reward for action and comm policies
-"COMM_LOSS_COEF": 0.1  # Weight for communication policy loss
+"COMM_LOSS_COEF": 1  # Weight for communication policy loss
 
 # WandB Params
 "ENTITY": ""

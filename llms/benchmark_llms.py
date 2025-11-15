@@ -231,7 +231,7 @@ class BenchmarkRunner:
             env = CoinGame(
                 num_agents=2,
                 num_inner_steps=1000,
-                regrow_rate=0.01,
+                regrow_rate=0.0005,  # Default regrow_rate
                 payoff_matrix=[[1, 1, -2], [1, 1, -2]],
                 cnn=True,
                 shared_rewards=False
@@ -541,13 +541,10 @@ Example usage:
         # Default: GPT-5.1 with default (none) and different reasoning levels, plus comparison models
         # Note: "none" means no reasoning parameter is passed (default behavior)
         model_configs = [
-            {"model": "gpt-5.1"},  # Default: no reasoning parameter (effort="none" by default)
-            {"model": "gpt-5.1", "reasoning": "low"},
+
             {"model": "gpt-5.1", "reasoning": "medium"},
-            {"model": "gpt-5.1", "reasoning": "high"},
-            {"model": "gpt-5-mini"},
-            {"model": "gpt-5-nano"},
-            {"model": "o3"},
+            {"model": "gpt-5-mini"}
+
         ]
     else:
         # Parse simple model names (backward compatibility)

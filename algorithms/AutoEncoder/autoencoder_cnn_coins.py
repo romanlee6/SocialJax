@@ -393,463 +393,463 @@ def aggregate_communication(comm_vectors, num_agents, comm_mode='avg'):
     return aggregated_comm
 
 
-def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden_batch, 
-                            proto_embeddings, num_agents, num_protos, comm_dim, config, rng,
-                            parameter_sharing=True, tom_predictions=None):
-    """
-    Generate counterfactual predictions for what other agents would do/believe
-    under each possible communication from the current agent.
+# def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden_batch, 
+#                             proto_embeddings, num_agents, num_protos, comm_dim, config, rng,
+#                             parameter_sharing=True, tom_predictions=None):
+#     """
+#     Generate counterfactual predictions for what other agents would do/believe
+#     under each possible communication from the current agent.
     
-    This implements counterfactual reasoning: "If I send message m, how would others respond?"
+#     This implements counterfactual reasoning: "If I send message m, how would others respond?"
     
-    For parameter sharing: Uses the shared policy to predict all agents' responses.
-    For non-parameter sharing: Uses each agent's actual policy to predict their response.
+#     For parameter sharing: Uses the shared policy to predict all agents' responses.
+#     For non-parameter sharing: Uses each agent's actual policy to predict their response.
     
-    **ToM Integration:**
-    If both USE_TOM and USE_INTRINSIC_REWARD are enabled, uses ToM predictions
-    for counterfactual belief states instead of running full forward passes.
-    This is more efficient and aligns with the theory that agents reason about
-    others' beliefs through their ToM model.
+#     **ToM Integration:**
+#     If both USE_TOM and USE_INTRINSIC_REWARD are enabled, uses ToM predictions
+#     for counterfactual belief states instead of running full forward passes.
+#     This is more efficient and aligns with the theory that agents reason about
+#     others' beliefs through their ToM model.
     
-    Dimension flow:
-    1. Input: (num_envs * num_agents, ...) 
-    2. Reshaped: (num_envs, num_agents, ...)
-    3. Tiled: (num_agents * num_protos * num_envs, num_agents, ...)
-    4. Flattened: (num_agents * num_protos * num_envs * num_agents, ...) for forward pass
-    5. Reshaped back: (num_agents, num_protos, num_envs, num_agents, ...)
-    6. Averaged: (num_agents, num_protos, num_agents, output_dim)
+#     Dimension flow:
+#     1. Input: (num_envs * num_agents, ...) 
+#     2. Reshaped: (num_envs, num_agents, ...)
+#     3. Tiled: (num_agents * num_protos * num_envs, num_agents, ...)
+#     4. Flattened: (num_agents * num_protos * num_envs * num_agents, ...) for forward pass
+#     5. Reshaped back: (num_agents, num_protos, num_envs, num_agents, ...)
+#     6. Averaged: (num_agents, num_protos, num_agents, output_dim)
     
-    Args:
-        network: The ActorCriticComm network (or list of networks if not parameter sharing)
-        params: Network parameters (or list of params if not parameter sharing)
-        obs_batch: Observations (num_envs * num_agents, ...)
-        prev_comm_batch: Previous communications (num_envs * num_agents, comm_dim)
-        hidden_batch: Hidden states (num_envs * num_agents, hidden_dim)
-        proto_embeddings: Prototype embeddings (num_protos, comm_dim) or list of embeddings
-        num_agents: Number of agents
-        num_protos: Number of prototype messages
-        comm_dim: Communication dimension
-        config: Configuration dict
-        rng: Random key
-        parameter_sharing: Whether using parameter sharing
-        tom_predictions: Optional ToM predictions (num_envs * num_agents, hidden_dim)
+#     Args:
+#         network: The ActorCriticComm network (or list of networks if not parameter sharing)
+#         params: Network parameters (or list of params if not parameter sharing)
+#         obs_batch: Observations (num_envs * num_agents, ...)
+#         prev_comm_batch: Previous communications (num_envs * num_agents, comm_dim)
+#         hidden_batch: Hidden states (num_envs * num_agents, hidden_dim)
+#         proto_embeddings: Prototype embeddings (num_protos, comm_dim) or list of embeddings
+#         num_agents: Number of agents
+#         num_protos: Number of prototype messages
+#         comm_dim: Communication dimension
+#         config: Configuration dict
+#         rng: Random key
+#         parameter_sharing: Whether using parameter sharing
+#         tom_predictions: Optional ToM predictions (num_envs * num_agents, hidden_dim)
         
-    Returns:
-        counterfactuals: (num_agents, num_protos, num_agents, output_dim)
-            where output_dim is:
-            - action_dim (for action influence): action probability distribution
-            - hidden_dim (for belief influence): GRU output (belief), not hidden state
-    """
-    num_envs = obs_batch.shape[0] // num_agents
+#     Returns:
+#         counterfactuals: (num_agents, num_protos, num_agents, output_dim)
+#             where output_dim is:
+#             - action_dim (for action influence): action probability distribution
+#             - hidden_dim (for belief influence): GRU output (belief), not hidden state
+#     """
+#     num_envs = obs_batch.shape[0] // num_agents
     
-    # Check if we should use ToM predictions for counterfactuals
-    use_tom_counterfactuals = (
-        config.get("USE_TOM", False) and 
-        tom_predictions is not None
-    )
+#     # Check if we should use ToM predictions for counterfactuals
+#     use_tom_counterfactuals = (
+#         config.get("USE_TOM", False) and 
+#         tom_predictions is not None
+#     )
     
-    # Note on the difference between ToM and non-ToM counterfactuals:
-    # BOTH cases run full forward passes with permuted communications.
-    # The difference is WHICH output we extract:
-    # - WITH ToM (use_tom_counterfactuals=True): Extract ToM predictions as counterfactual beliefs
-    #   This represents the agent's mental model of how others would think under different comms
-    # - WITHOUT ToM (use_tom_counterfactuals=False): Extract actual belief states as counterfactual beliefs  
-    #   This represents the ground truth of how others actually would think
-    # In both cases, actual_outputs in compute_social_influence_reward() contains current beliefs.
+#     # Note on the difference between ToM and non-ToM counterfactuals:
+#     # BOTH cases run full forward passes with permuted communications.
+#     # The difference is WHICH output we extract:
+#     # - WITH ToM (use_tom_counterfactuals=True): Extract ToM predictions as counterfactual beliefs
+#     #   This represents the agent's mental model of how others would think under different comms
+#     # - WITHOUT ToM (use_tom_counterfactuals=False): Extract actual belief states as counterfactual beliefs  
+#     #   This represents the ground truth of how others actually would think
+#     # In both cases, actual_outputs in compute_social_influence_reward() contains current beliefs.
     
-    # Reshape to (num_envs, num_agents, ...)
-    obs_reshaped = obs_batch.reshape(num_envs, num_agents, *obs_batch.shape[1:])
-    prev_comm_reshaped = prev_comm_batch.reshape(num_envs, num_agents, comm_dim)
-    hidden_reshaped = hidden_batch.reshape(num_envs, num_agents, -1)
+#     # Reshape to (num_envs, num_agents, ...)
+#     obs_reshaped = obs_batch.reshape(num_envs, num_agents, *obs_batch.shape[1:])
+#     prev_comm_reshaped = prev_comm_batch.reshape(num_envs, num_agents, comm_dim)
+#     hidden_reshaped = hidden_batch.reshape(num_envs, num_agents, -1)
     
-    # For each agent k and each prototype v, compute counterfactual predictions
-    # We need predictions for all agents in each scenario
-    # Total batch size: num_agents (which agent sends) * num_protos (which message) * num_envs * num_agents (predictions for each agent)
-    batch_size = num_agents * num_protos * num_envs * num_agents
+#     # For each agent k and each prototype v, compute counterfactual predictions
+#     # We need predictions for all agents in each scenario
+#     # Total batch size: num_agents (which agent sends) * num_protos (which message) * num_envs * num_agents (predictions for each agent)
+#     batch_size = num_agents * num_protos * num_envs * num_agents
     
-    # Repeat observations for all counterfactual scenarios
-    # After tiling: (num_agents * num_protos * num_envs, num_agents, ...)
-    obs_repeated = jnp.tile(obs_reshaped, (num_agents * num_protos, 1, 1, 1, 1))
-    # Flatten to (num_agents * num_protos * num_envs * num_agents, ...)
-    obs_repeated = obs_repeated.reshape(-1, *obs_batch.shape[1:])
+#     # Repeat observations for all counterfactual scenarios
+#     # After tiling: (num_agents * num_protos * num_envs, num_agents, ...)
+#     obs_repeated = jnp.tile(obs_reshaped, (num_agents * num_protos, 1, 1, 1, 1))
+#     # Flatten to (num_agents * num_protos * num_envs * num_agents, ...)
+#     obs_repeated = obs_repeated.reshape(-1, *obs_batch.shape[1:])
     
-    # Same for hidden states
-    hidden_repeated = jnp.tile(hidden_reshaped, (num_agents * num_protos, 1, 1))
-    hidden_repeated = hidden_repeated.reshape(-1, hidden_reshaped.shape[-1])
+#     # Same for hidden states
+#     hidden_repeated = jnp.tile(hidden_reshaped, (num_agents * num_protos, 1, 1))
+#     hidden_repeated = hidden_repeated.reshape(-1, hidden_reshaped.shape[-1])
     
-    # Create counterfactual communications
-    # For each (agent_k, proto_v), replace agent_k's comm with proto_v
-    comm_counterfactual = jnp.tile(prev_comm_reshaped, (num_agents * num_protos, 1, 1))
+#     # Create counterfactual communications
+#     # For each (agent_k, proto_v), replace agent_k's comm with proto_v
+#     comm_counterfactual = jnp.tile(prev_comm_reshaped, (num_agents * num_protos, 1, 1))
     
-    # Generate indices for replacement
-    agent_indices = jnp.arange(num_agents).repeat(num_protos * num_envs)
-    proto_indices = jnp.tile(jnp.arange(num_protos).repeat(num_envs), num_agents)
-    env_indices = jnp.tile(jnp.arange(num_envs), num_agents * num_protos)
+#     # Generate indices for replacement
+#     agent_indices = jnp.arange(num_agents).repeat(num_protos * num_envs)
+#     proto_indices = jnp.tile(jnp.arange(num_protos).repeat(num_envs), num_agents)
+#     env_indices = jnp.tile(jnp.arange(num_envs), num_agents * num_protos)
     
-    # Replace with prototype embeddings
-    if parameter_sharing:
-        # Single set of prototypes
-        comm_counterfactual = comm_counterfactual.at[
-            jnp.arange(num_agents * num_protos * num_envs), 
-            agent_indices
-        ].set(proto_embeddings[proto_indices])
-    else:
-        # Each agent has their own prototypes
-        # Use vectorized indexing instead of Python loop
-        # Stack all prototypes: (num_agents, num_protos, comm_dim) -> index by [agent_idx, proto_idx]
-        proto_stack = jnp.stack(proto_embeddings, axis=0)  # (num_agents, num_protos, comm_dim)
-        # Get the appropriate prototypes for each scenario
-        selected_protos = proto_stack[agent_indices, proto_indices]  # (num_agents*num_protos*num_envs, comm_dim)
-        # Set them in the counterfactual communications
-        comm_counterfactual = comm_counterfactual.at[
-            jnp.arange(num_agents * num_protos * num_envs),
-            agent_indices
-        ].set(selected_protos)
+#     # Replace with prototype embeddings
+#     if parameter_sharing:
+#         # Single set of prototypes
+#         comm_counterfactual = comm_counterfactual.at[
+#             jnp.arange(num_agents * num_protos * num_envs), 
+#             agent_indices
+#         ].set(proto_embeddings[proto_indices])
+#     else:
+#         # Each agent has their own prototypes
+#         # Use vectorized indexing instead of Python loop
+#         # Stack all prototypes: (num_agents, num_protos, comm_dim) -> index by [agent_idx, proto_idx]
+#         proto_stack = jnp.stack(proto_embeddings, axis=0)  # (num_agents, num_protos, comm_dim)
+#         # Get the appropriate prototypes for each scenario
+#         selected_protos = proto_stack[agent_indices, proto_indices]  # (num_agents*num_protos*num_envs, comm_dim)
+#         # Set them in the counterfactual communications
+#         comm_counterfactual = comm_counterfactual.at[
+#             jnp.arange(num_agents * num_protos * num_envs),
+#             agent_indices
+#         ].set(selected_protos)
     
-    # Aggregate counterfactual communications
-    comm_counterfactual_reshaped = comm_counterfactual.reshape(
-        num_agents * num_protos * num_envs, num_agents, comm_dim
-    )
-    aggregated_comm = jax.vmap(
-        lambda c: aggregate_communication(
-            jnp.expand_dims(c, 0), num_agents, config.get("COMM_MODE", "avg")
-        ).squeeze(0)
-    )(comm_counterfactual_reshaped)
+#     # Aggregate counterfactual communications
+#     comm_counterfactual_reshaped = comm_counterfactual.reshape(
+#         num_agents * num_protos * num_envs, num_agents, comm_dim
+#     )
+#     aggregated_comm = jax.vmap(
+#         lambda c: aggregate_communication(
+#             jnp.expand_dims(c, 0), num_agents, config.get("COMM_MODE", "avg")
+#         ).squeeze(0)
+#     )(comm_counterfactual_reshaped)
     
-    # aggregated_comm shape: (num_agents * num_protos * num_envs, num_agents, comm_dim)
-    # Flatten to (num_agents * num_protos * num_envs * num_agents, comm_dim)
-    aggregated_comm_flat = aggregated_comm.reshape(-1, comm_dim)
+#     # aggregated_comm shape: (num_agents * num_protos * num_envs, num_agents, comm_dim)
+#     # Flatten to (num_agents * num_protos * num_envs * num_agents, comm_dim)
+#     aggregated_comm_flat = aggregated_comm.reshape(-1, comm_dim)
     
-    # Forward pass through network to get counterfactual predictions
-    # The key difference when using ToM: we extract ToM predictions instead of actual beliefs
-    rng_split = jax.random.split(rng, batch_size)
+#     # Forward pass through network to get counterfactual predictions
+#     # The key difference when using ToM: we extract ToM predictions instead of actual beliefs
+#     rng_split = jax.random.split(rng, batch_size)
     
-    if parameter_sharing:
-        # Use shared policy for all agents
-        action_logits_cf, _, _, _, hidden_cf, belief_cf, tom_pred_cf = jax.vmap(
-            lambda obs, comm, hid, r: network.apply(
-                params,
-                jnp.expand_dims(obs, 0),
-                jnp.expand_dims(comm, 0),
-                jnp.expand_dims(hid, 0),
-                train_mode=False,
-                rngs={'gumbel': r}
-            )
-        )(obs_repeated, aggregated_comm_flat, hidden_repeated, rng_split)
+#     if parameter_sharing:
+#         # Use shared policy for all agents
+#         action_logits_cf, _, _, _, hidden_cf, belief_cf, tom_pred_cf = jax.vmap(
+#             lambda obs, comm, hid, r: network.apply(
+#                 params,
+#                 jnp.expand_dims(obs, 0),
+#                 jnp.expand_dims(comm, 0),
+#                 jnp.expand_dims(hid, 0),
+#                 train_mode=False,
+#                 rngs={'gumbel': r}
+#             )
+#         )(obs_repeated, aggregated_comm_flat, hidden_repeated, rng_split)
         
-        # Reshape to remove extra dimensions (from expand_dims in network call)
-        action_logits_cf = action_logits_cf.reshape(batch_size, -1)
-        hidden_cf = hidden_cf.reshape(batch_size, -1)
-        belief_cf = belief_cf.reshape(batch_size, -1)
-        if tom_pred_cf is not None:
-            tom_pred_cf = tom_pred_cf.reshape(batch_size, -1)
-    else:
-        # Use each agent's own policy for predictions
-        # Process each receiving agent's predictions separately to avoid dynamic indexing
-        # batch structure: (sending_agent * num_protos * num_envs * receiving_agent)
+#         # Reshape to remove extra dimensions (from expand_dims in network call)
+#         action_logits_cf = action_logits_cf.reshape(batch_size, -1)
+#         hidden_cf = hidden_cf.reshape(batch_size, -1)
+#         belief_cf = belief_cf.reshape(batch_size, -1)
+#         if tom_pred_cf is not None:
+#             tom_pred_cf = tom_pred_cf.reshape(batch_size, -1)
+#     else:
+#         # Use each agent's own policy for predictions
+#         # Process each receiving agent's predictions separately to avoid dynamic indexing
+#         # batch structure: (sending_agent * num_protos * num_envs * receiving_agent)
         
-        all_action_logits = []
-        all_hidden = []
-        all_belief = []
-        all_tom_pred = []
+#         all_action_logits = []
+#         all_hidden = []
+#         all_belief = []
+#         all_tom_pred = []
         
-        for agent_idx in range(num_agents):
-            # Get indices for this receiving agent
-            # For each (sending_agent, proto, env) combination, get the prediction for this receiving agent
-            agent_indices = jnp.arange(agent_idx, batch_size, num_agents)
+#         for agent_idx in range(num_agents):
+#             # Get indices for this receiving agent
+#             # For each (sending_agent, proto, env) combination, get the prediction for this receiving agent
+#             agent_indices = jnp.arange(agent_idx, batch_size, num_agents)
             
-            # Get data for this agent
-            obs_agent = obs_repeated[agent_indices]
-            comm_agent = aggregated_comm_flat[agent_indices]
-            hidden_agent = hidden_repeated[agent_indices]
-            rng_agent = rng_split[agent_indices]
+#             # Get data for this agent
+#             obs_agent = obs_repeated[agent_indices]
+#             comm_agent = aggregated_comm_flat[agent_indices]
+#             hidden_agent = hidden_repeated[agent_indices]
+#             rng_agent = rng_split[agent_indices]
             
-            # Apply this agent's policy
-            action_logits_i, _, _, _, hidden_i, belief_i, tom_pred_i = jax.vmap(
-                lambda obs, comm, hid, r: network[agent_idx].apply(
-                    params[agent_idx],
-                    jnp.expand_dims(obs, 0),
-                    jnp.expand_dims(comm, 0),
-                    jnp.expand_dims(hid, 0),
-                    train_mode=False,
-                    rngs={'gumbel': r}
-                )
-            )(obs_agent, comm_agent, hidden_agent, rng_agent)
+#             # Apply this agent's policy
+#             action_logits_i, _, _, _, hidden_i, belief_i, tom_pred_i = jax.vmap(
+#                 lambda obs, comm, hid, r: network[agent_idx].apply(
+#                     params[agent_idx],
+#                     jnp.expand_dims(obs, 0),
+#                     jnp.expand_dims(comm, 0),
+#                     jnp.expand_dims(hid, 0),
+#                     train_mode=False,
+#                     rngs={'gumbel': r}
+#                 )
+#             )(obs_agent, comm_agent, hidden_agent, rng_agent)
             
-            # Reshape to remove extra dimensions (from expand_dims in network call)
-            # The vmap outputs have shape (batch_per_agent, 1, 1, dim) -> reshape to (batch_per_agent, dim)
-            batch_per_agent = action_logits_i.shape[0]
-            action_logits_i = action_logits_i.reshape(batch_per_agent, -1)
-            hidden_i = hidden_i.reshape(batch_per_agent, -1)
-            belief_i = belief_i.reshape(batch_per_agent, -1)
-            if tom_pred_i is not None:
-                tom_pred_i = tom_pred_i.reshape(batch_per_agent, -1)
+#             # Reshape to remove extra dimensions (from expand_dims in network call)
+#             # The vmap outputs have shape (batch_per_agent, 1, 1, dim) -> reshape to (batch_per_agent, dim)
+#             batch_per_agent = action_logits_i.shape[0]
+#             action_logits_i = action_logits_i.reshape(batch_per_agent, -1)
+#             hidden_i = hidden_i.reshape(batch_per_agent, -1)
+#             belief_i = belief_i.reshape(batch_per_agent, -1)
+#             if tom_pred_i is not None:
+#                 tom_pred_i = tom_pred_i.reshape(batch_per_agent, -1)
             
-            all_action_logits.append(action_logits_i)
-            all_hidden.append(hidden_i)
-            all_belief.append(belief_i)
-            all_tom_pred.append(tom_pred_i)
+#             all_action_logits.append(action_logits_i)
+#             all_hidden.append(hidden_i)
+#             all_belief.append(belief_i)
+#             all_tom_pred.append(tom_pred_i)
     
-    # Interleave results to match the batch structure
-    # Stack and reshape to get back to (batch_size, ...) order
-    action_logits_cf = jnp.stack(all_action_logits, axis=1)  # (batch_size//num_agents, num_agents, ...)
-    action_logits_cf = action_logits_cf.reshape(batch_size, -1)
+#     # Interleave results to match the batch structure
+#     # Stack and reshape to get back to (batch_size, ...) order
+#     action_logits_cf = jnp.stack(all_action_logits, axis=1)  # (batch_size//num_agents, num_agents, ...)
+#     action_logits_cf = action_logits_cf.reshape(batch_size, -1)
     
-    hidden_cf = jnp.stack(all_hidden, axis=1)
-    hidden_cf = hidden_cf.reshape(batch_size, -1)
+#     hidden_cf = jnp.stack(all_hidden, axis=1)
+#     hidden_cf = hidden_cf.reshape(batch_size, -1)
     
-    belief_cf = jnp.stack(all_belief, axis=1)
-    belief_cf = belief_cf.reshape(batch_size, -1)
+#     belief_cf = jnp.stack(all_belief, axis=1)
+#     belief_cf = belief_cf.reshape(batch_size, -1)
     
-    # Only stack ToM predictions if they exist (not None when no_tom is disabled)
-    if all_tom_pred[0] is not None:
-        tom_pred_cf = jnp.stack(all_tom_pred, axis=1)
-        tom_pred_cf = tom_pred_cf.reshape(batch_size, -1)
-    else:
-        tom_pred_cf = None
+#     # Only stack ToM predictions if they exist (not None when no_tom is disabled)
+#     if all_tom_pred[0] is not None:
+#         tom_pred_cf = jnp.stack(all_tom_pred, axis=1)
+#         tom_pred_cf = tom_pred_cf.reshape(batch_size, -1)
+#     else:
+#         tom_pred_cf = None
     
-    # Reshape to (num_agents, num_protos, num_envs, num_agents, ...)
-    action_logits_cf = action_logits_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
-    belief_cf = belief_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
-    if tom_pred_cf is not None:
-        tom_pred_cf = tom_pred_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
+#     # Reshape to (num_agents, num_protos, num_envs, num_agents, ...)
+#     action_logits_cf = action_logits_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
+#     belief_cf = belief_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
+#     if tom_pred_cf is not None:
+#         tom_pred_cf = tom_pred_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
     
-    # Average over environments
-    if config.get("INFLUENCE_TARGET", "belief") == "action":
-        # Return action probabilities
-        action_probs = jax.nn.softmax(action_logits_cf, axis=-1)
-        return action_probs.mean(axis=2)  # (num_agents, num_protos, num_agents, action_dim)
-    else:
-        # Return belief states: use ToM predictions if enabled, otherwise use actual beliefs
-        if use_tom_counterfactuals and tom_pred_cf is not None:
-            # Use ToM predictions as counterfactual beliefs
-            # This represents each agent's theory of how others' beliefs change with different communications
-            return tom_pred_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
-        else:
-            # Use actual belief states (ground truth) as counterfactual beliefs
-            return belief_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
+#     # Average over environments
+#     if config.get("INFLUENCE_TARGET", "belief") == "action":
+#         # Return action probabilities
+#         action_probs = jax.nn.softmax(action_logits_cf, axis=-1)
+#         return action_probs.mean(axis=2)  # (num_agents, num_protos, num_agents, action_dim)
+#     else:
+#         # Return belief states: use ToM predictions if enabled, otherwise use actual beliefs
+#         if use_tom_counterfactuals and tom_pred_cf is not None:
+#             # Use ToM predictions as counterfactual beliefs
+#             # This represents each agent's theory of how others' beliefs change with different communications
+#             return tom_pred_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
+#         else:
+#             # Use actual belief states (ground truth) as counterfactual beliefs
+#             return belief_cf.mean(axis=2)  # (num_agents, num_protos, num_agents, hidden_dim)
 
 
-def marginalize_over_own_comm(comm_probs, counterfactuals, epsilon=1e-8):
-    """
-    Marginalize counterfactual predictions over agent's own communication distribution.
+# def marginalize_over_own_comm(comm_probs, counterfactuals, epsilon=1e-8):
+#     """
+#     Marginalize counterfactual predictions over agent's own communication distribution.
     
-    This computes: E_{m ~ π_comm(m|s_k)}[prediction(s_j | m_k=m)]
+#     This computes: E_{m ~ π_comm(m|s_k)}[prediction(s_j | m_k=m)]
     
-    Args:
-        comm_probs: (num_envs * num_agents, num_protos) - communication probabilities
-        counterfactuals: (num_agents, num_protos, num_agents, output_dim)
+#     Args:
+#         comm_probs: (num_envs * num_agents, num_protos) - communication probabilities
+#         counterfactuals: (num_agents, num_protos, num_agents, output_dim)
         
-    Returns:
-        marginal: (num_agents, num_agents, output_dim) - marginalized predictions
-    """
-    num_agents = counterfactuals.shape[0]
-    num_protos = counterfactuals.shape[1]
-    output_dim = counterfactuals.shape[-1]
+#     Returns:
+#         marginal: (num_agents, num_agents, output_dim) - marginalized predictions
+#     """
+#     num_agents = counterfactuals.shape[0]
+#     num_protos = counterfactuals.shape[1]
+#     output_dim = counterfactuals.shape[-1]
     
-    # Reshape comm_probs to (num_agents, num_protos)
-    # Assuming single environment or averaged
-    comm_probs_reshaped = comm_probs.reshape(-1, num_agents, num_protos).mean(axis=0)
+#     # Reshape comm_probs to (num_agents, num_protos)
+#     # Assuming single environment or averaged
+#     comm_probs_reshaped = comm_probs.reshape(-1, num_agents, num_protos).mean(axis=0)
     
-    # Weighted sum: (k, j, d)
-    # marginal[k, j] = sum_v comm_probs[k, v] * counterfactuals[k, v, j]
-    marginal = jnp.einsum('kv,kvjd->kjd', comm_probs_reshaped, counterfactuals)
+#     # Weighted sum: (k, j, d)
+#     # marginal[k, j] = sum_v comm_probs[k, v] * counterfactuals[k, v, j]
+#     marginal = jnp.einsum('kv,kvjd->kjd', comm_probs_reshaped, counterfactuals)
     
-    # Normalize
-    norm = comm_probs_reshaped.sum(axis=1, keepdims=True)[..., None] + epsilon
-    marginal = marginal / norm
+#     # Normalize
+#     norm = comm_probs_reshaped.sum(axis=1, keepdims=True)[..., None] + epsilon
+#     marginal = marginal / norm
     
-    return marginal
+#     return marginal
 
 
-def compute_kl_divergence(p, q, epsilon=1e-8):
-    """
-    Compute KL divergence KL(p || q) for probability distributions.
+# def compute_kl_divergence(p, q, epsilon=1e-8):
+#     """
+#     Compute KL divergence KL(p || q) for probability distributions.
     
-    Args:
-        p: probability distribution (should sum to 1)
-        q: probability distribution (should sum to 1)
-        epsilon: small constant for numerical stability
+#     Args:
+#         p: probability distribution (should sum to 1)
+#         q: probability distribution (should sum to 1)
+#         epsilon: small constant for numerical stability
         
-    Returns:
-        kl_div: scalar KL divergence value
-    """
-    # Clamp probabilities to avoid log(0)
-    p = jnp.clip(p, epsilon, 1.0)
-    q = jnp.clip(q, epsilon, 1.0)
-    return jnp.sum(p * jnp.log(p / q))
+#     Returns:
+#         kl_div: scalar KL divergence value
+#     """
+#     # Clamp probabilities to avoid log(0)
+#     p = jnp.clip(p, epsilon, 1.0)
+#     q = jnp.clip(q, epsilon, 1.0)
+#     return jnp.sum(p * jnp.log(p / q))
 
 
-def compute_supervised_belief_loss(tom_predictions, ground_truth_beliefs, config):
-    """
-    Compute supervised loss for ToM belief predictions using cosine similarity.
+# def compute_supervised_belief_loss(tom_predictions, ground_truth_beliefs, config):
+#     """
+#     Compute supervised loss for ToM belief predictions using cosine similarity.
     
-    Args:
-        tom_predictions: (num_envs * num_agents, hidden_dim) - ToM predicted beliefs
-        ground_truth_beliefs: (num_envs * num_agents, hidden_dim) - actual belief states of other agents
-        config: Configuration dict
+#     Args:
+#         tom_predictions: (num_envs * num_agents, hidden_dim) - ToM predicted beliefs
+#         ground_truth_beliefs: (num_envs * num_agents, hidden_dim) - actual belief states of other agents
+#         config: Configuration dict
         
-    Returns:
-        loss: scalar supervised loss value (1 - cosine_similarity)
-    """
-    # Compute cosine similarity
-    dot_product = jnp.sum(tom_predictions * ground_truth_beliefs, axis=-1)
-    tom_norm = jnp.linalg.norm(tom_predictions, axis=-1) + 1e-8
-    belief_norm = jnp.linalg.norm(ground_truth_beliefs, axis=-1) + 1e-8
-    cos_sim = dot_product / (tom_norm * belief_norm)
+#     Returns:
+#         loss: scalar supervised loss value (1 - cosine_similarity)
+#     """
+#     # Compute cosine similarity
+#     dot_product = jnp.sum(tom_predictions * ground_truth_beliefs, axis=-1)
+#     tom_norm = jnp.linalg.norm(tom_predictions, axis=-1) + 1e-8
+#     belief_norm = jnp.linalg.norm(ground_truth_beliefs, axis=-1) + 1e-8
+#     cos_sim = dot_product / (tom_norm * belief_norm)
     
-    # Loss = 1 - cosine_similarity (minimize to increase similarity)
-    loss = jnp.mean(1.0 - cos_sim)
-    return loss
+#     # Loss = 1 - cosine_similarity (minimize to increase similarity)
+#     loss = jnp.mean(1.0 - cos_sim)
+#     return loss
 
 
-def compute_supervised_comm_loss(comm_vectors, target_comm_vectors, config):
-    """
-    Compute supervised loss for communication based on cosine similarity.
+# def compute_supervised_comm_loss(comm_vectors, target_comm_vectors, config):
+#     """
+#     Compute supervised loss for communication based on cosine similarity.
     
-    Args:
-        comm_vectors: (num_envs * num_agents, comm_dim) - predicted communication vectors
-        target_comm_vectors: (num_envs * num_agents, comm_dim) - target communication vectors
-        config: Configuration dict
+#     Args:
+#         comm_vectors: (num_envs * num_agents, comm_dim) - predicted communication vectors
+#         target_comm_vectors: (num_envs * num_agents, comm_dim) - target communication vectors
+#         config: Configuration dict
         
-    Returns:
-        loss: scalar supervised loss value (1 - cosine_similarity)
-    """
-    # Compute cosine similarity between predicted and target communication vectors
-    dot_product = jnp.sum(comm_vectors * target_comm_vectors, axis=-1)
-    comm_norm = jnp.linalg.norm(comm_vectors, axis=-1) + 1e-8
-    target_norm = jnp.linalg.norm(target_comm_vectors, axis=-1) + 1e-8
-    cos_sim = dot_product / (comm_norm * target_norm)
+#     Returns:
+#         loss: scalar supervised loss value (1 - cosine_similarity)
+#     """
+#     # Compute cosine similarity between predicted and target communication vectors
+#     dot_product = jnp.sum(comm_vectors * target_comm_vectors, axis=-1)
+#     comm_norm = jnp.linalg.norm(comm_vectors, axis=-1) + 1e-8
+#     target_norm = jnp.linalg.norm(target_comm_vectors, axis=-1) + 1e-8
+#     cos_sim = dot_product / (comm_norm * target_norm)
     
-    # Loss = 1 - cosine_similarity (minimize to increase similarity)
-    loss = jnp.mean(1.0 - cos_sim)
-    return loss
+#     # Loss = 1 - cosine_similarity (minimize to increase similarity)
+#     loss = jnp.mean(1.0 - cos_sim)
+#     return loss
 
 
-def load_offline_llm_dataset(data_path, env_name, config):
-    """
-    Load offline LLM dataset for supervised communication/belief training.
+# def load_offline_llm_dataset(data_path, env_name, config):
+#     """
+#     Load offline LLM dataset for supervised communication/belief training.
     
-    *** UNDER CONSTRUCTION ***
-    This function is a placeholder for loading pre-collected LLM interaction data.
+#     *** UNDER CONSTRUCTION ***
+#     This function is a placeholder for loading pre-collected LLM interaction data.
     
-    The dataset should contain:
-    - State observations
-    - Communication embeddings from LLM reasoning
-    - Belief state predictions
-    - Action distributions
+#     The dataset should contain:
+#     - State observations
+#     - Communication embeddings from LLM reasoning
+#     - Belief state predictions
+#     - Action distributions
     
-    Expected format:
-    {
-        'observations': array of shape (N, obs_dim),
-        'communications': array of shape (N, comm_dim),
-        'beliefs': array of shape (N, hidden_dim),
-        'actions': array of shape (N, action_dim),
-        'state_keys': list of state tuples for indexing
-    }
+#     Expected format:
+#     {
+#         'observations': array of shape (N, obs_dim),
+#         'communications': array of shape (N, comm_dim),
+#         'beliefs': array of shape (N, hidden_dim),
+#         'actions': array of shape (N, action_dim),
+#         'state_keys': list of state tuples for indexing
+#     }
     
-    TODO:
-    - Define exact data format specification
-    - Implement data loading from pickle/numpy files
-    - Add data preprocessing and normalization
-    - Implement state matching/similarity functions
-    - Add caching for efficiency
+#     TODO:
+#     - Define exact data format specification
+#     - Implement data loading from pickle/numpy files
+#     - Add data preprocessing and normalization
+#     - Implement state matching/similarity functions
+#     - Add caching for efficiency
     
-    Args:
-        data_path: str, path to offline dataset
-        env_name: str, name of environment
-        config: Configuration dict
+#     Args:
+#         data_path: str, path to offline dataset
+#         env_name: str, name of environment
+#         config: Configuration dict
         
-    Returns:
-        dataset: dict containing offline data, or None if not available
-    """
-    # PLACEHOLDER IMPLEMENTATION
-    print("="*70)
-    print("WARNING: Offline LLM dataset loading is UNDER CONSTRUCTION")
-    print("This feature is not yet fully implemented.")
-    print("To use supervised learning from LLM data:")
-    print("  1. Collect LLM trajectories using llms/coins_llm_simulation.py")
-    print("  2. Process and format the data into required structure")
-    print("  3. Implement data loading logic in this function")
-    print("  4. Set SUPERVISED_COMM or SUPERVISED_BELIEF to 'llm' in config")
-    print("="*70)
+#     Returns:
+#         dataset: dict containing offline data, or None if not available
+#     """
+#     # PLACEHOLDER IMPLEMENTATION
+#     print("="*70)
+#     print("WARNING: Offline LLM dataset loading is UNDER CONSTRUCTION")
+#     print("This feature is not yet fully implemented.")
+#     print("To use supervised learning from LLM data:")
+#     print("  1. Collect LLM trajectories using llms/coins_llm_simulation.py")
+#     print("  2. Process and format the data into required structure")
+#     print("  3. Implement data loading logic in this function")
+#     print("  4. Set SUPERVISED_COMM or SUPERVISED_BELIEF to 'llm' in config")
+#     print("="*70)
     
-    # Return None to indicate dataset not available
-    return None
+#     # Return None to indicate dataset not available
+#     return None
 
 
-def compute_social_influence_reward(belief_states, comm_logits, counterfactuals, 
-                                    actual_outputs, config):
-    """
-    Compute social influence intrinsic reward.
+# def compute_social_influence_reward(belief_states, comm_logits, counterfactuals, 
+#                                     actual_outputs, config):
+#     """
+#     Compute social influence intrinsic reward.
     
-    Measures how much an agent's communication changes other agents' behaviors/beliefs.
-    Uses different similarity measures based on influence target:
-    - For belief: cosine similarity
-    - For action: KL divergence (since they are probability distributions)
+#     Measures how much an agent's communication changes other agents' behaviors/beliefs.
+#     Uses different similarity measures based on influence target:
+#     - For belief: cosine similarity
+#     - For action: KL divergence (since they are probability distributions)
     
-    Args:
-        belief_states: (num_envs * num_agents, hidden_dim) - current belief states
-        comm_logits: (num_envs * num_agents, num_protos) - communication logits
-        counterfactuals: (num_agents, num_protos, num_agents, output_dim)
-        actual_outputs: (num_envs * num_agents, output_dim) - actual actions or beliefs
-        config: Configuration dict
+#     Args:
+#         belief_states: (num_envs * num_agents, hidden_dim) - current belief states
+#         comm_logits: (num_envs * num_agents, num_protos) - communication logits
+#         counterfactuals: (num_agents, num_protos, num_agents, output_dim)
+#         actual_outputs: (num_envs * num_agents, output_dim) - actual actions or beliefs
+#         config: Configuration dict
         
-    Returns:
-        influence_reward: (num_agents,) - influence reward for each agent
-    """
-    num_agents = counterfactuals.shape[0]
-    influence_target = config.get("INFLUENCE_TARGET", "belief")
+#     Returns:
+#         influence_reward: (num_agents,) - influence reward for each agent
+#     """
+#     num_agents = counterfactuals.shape[0]
+#     influence_target = config.get("INFLUENCE_TARGET", "belief")
     
-    # Get communication probabilities
-    comm_probs = jax.nn.softmax(comm_logits, axis=-1)
+#     # Get communication probabilities
+#     comm_probs = jax.nn.softmax(comm_logits, axis=-1)
     
-    # Marginalize counterfactuals over own communication
-    marginal_predictions = marginalize_over_own_comm(comm_probs, counterfactuals)
+#     # Marginalize counterfactuals over own communication
+#     marginal_predictions = marginalize_over_own_comm(comm_probs, counterfactuals)
     
-    # Reshape actual outputs to (num_agents, output_dim)
-    actual_outputs_reshaped = actual_outputs.reshape(-1, num_agents, actual_outputs.shape[-1]).mean(axis=0)
+#     # Reshape actual outputs to (num_agents, output_dim)
+#     actual_outputs_reshaped = actual_outputs.reshape(-1, num_agents, actual_outputs.shape[-1]).mean(axis=0)
     
-    # Expand actual outputs to compare with marginal predictions
-    # actual_outputs[k, j] should be agent j's actual output
-    actual_expanded = jnp.tile(
-        jnp.expand_dims(actual_outputs_reshaped, 0), 
-        (num_agents, 1, 1)
-    )  # (num_agents, num_agents, output_dim)
+#     # Expand actual outputs to compare with marginal predictions
+#     # actual_outputs[k, j] should be agent j's actual output
+#     actual_expanded = jnp.tile(
+#         jnp.expand_dims(actual_outputs_reshaped, 0), 
+#         (num_agents, 1, 1)
+#     )  # (num_agents, num_agents, output_dim)
     
-    # Compute influence based on target type
-    if influence_target == "action":
-        # For action distributions, use KL divergence
-        # Convert logits to probabilities if needed
-        marginal_probs = jax.nn.softmax(marginal_predictions, axis=-1)
-        actual_probs = jax.nn.softmax(actual_expanded, axis=-1)
+#     # Compute influence based on target type
+#     if influence_target == "action":
+#         # For action distributions, use KL divergence
+#         # Convert logits to probabilities if needed
+#         marginal_probs = jax.nn.softmax(marginal_predictions, axis=-1)
+#         actual_probs = jax.nn.softmax(actual_expanded, axis=-1)
         
-        # Compute KL divergence: KL(actual || marginal)
-        # Higher KL = more influence (communication changes the distribution more)
-        influence = jax.vmap(
-            lambda pred, actual: jax.vmap(
-                lambda p, a: compute_kl_divergence(a, p)
-            )(pred, actual)
-        )(marginal_probs, actual_probs)
-    else:
-        # For belief states, use cosine similarity
-        # 1 - similarity gives influence
-        sim = jax.vmap(
-            lambda pred, actual: jax.vmap(
-                lambda p, a: jnp.dot(p, a) / (jnp.linalg.norm(p) * jnp.linalg.norm(a) + 1e-8)
-            )(pred, actual)
-        )(marginal_predictions, actual_expanded)
+#         # Compute KL divergence: KL(actual || marginal)
+#         # Higher KL = more influence (communication changes the distribution more)
+#         influence = jax.vmap(
+#             lambda pred, actual: jax.vmap(
+#                 lambda p, a: compute_kl_divergence(a, p)
+#             )(pred, actual)
+#         )(marginal_probs, actual_probs)
+#     else:
+#         # For belief states, use cosine similarity
+#         # 1 - similarity gives influence
+#         sim = jax.vmap(
+#             lambda pred, actual: jax.vmap(
+#                 lambda p, a: jnp.dot(p, a) / (jnp.linalg.norm(p) * jnp.linalg.norm(a) + 1e-8)
+#             )(pred, actual)
+#         )(marginal_predictions, actual_expanded)
         
-        influence = 1.0 - sim
+#         influence = 1.0 - sim
     
-    # Mask out self-influence (diagonal)
-    mask = ~jnp.eye(num_agents, dtype=bool)
-    masked_influence = jnp.where(mask, influence, 0.0)
+#     # Mask out self-influence (diagonal)
+#     mask = ~jnp.eye(num_agents, dtype=bool)
+#     masked_influence = jnp.where(mask, influence, 0.0)
     
-    # Average influence over other agents
-    influence_reward = masked_influence.sum(axis=1) / (num_agents - 1)
+#     # Average influence over other agents
+#     influence_reward = masked_influence.sum(axis=1) / (num_agents - 1)
     
-    return influence_reward
+#     return influence_reward
 
 
 def make_train_comm(config):
