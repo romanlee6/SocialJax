@@ -644,24 +644,24 @@ def generate_counterfactuals(network, params, obs_batch, prev_comm_batch, hidden
             all_hidden.append(hidden_i)
             all_belief.append(belief_i)
             all_tom_pred.append(tom_pred_i)
-    
-    # Interleave results to match the batch structure
-    # Stack and reshape to get back to (batch_size, ...) order
-    action_logits_cf = jnp.stack(all_action_logits, axis=1)  # (batch_size//num_agents, num_agents, ...)
-    action_logits_cf = action_logits_cf.reshape(batch_size, -1)
-    
-    hidden_cf = jnp.stack(all_hidden, axis=1)
-    hidden_cf = hidden_cf.reshape(batch_size, -1)
-    
-    belief_cf = jnp.stack(all_belief, axis=1)
-    belief_cf = belief_cf.reshape(batch_size, -1)
-    
-    # Only stack ToM predictions if they exist (not None when no_tom is disabled)
-    if all_tom_pred[0] is not None:
-        tom_pred_cf = jnp.stack(all_tom_pred, axis=1)
-        tom_pred_cf = tom_pred_cf.reshape(batch_size, -1)
-    else:
-        tom_pred_cf = None
+        
+        # Interleave results to match the batch structure
+        # Stack and reshape to get back to (batch_size, ...) order
+        action_logits_cf = jnp.stack(all_action_logits, axis=1)  # (batch_size//num_agents, num_agents, ...)
+        action_logits_cf = action_logits_cf.reshape(batch_size, -1)
+        
+        hidden_cf = jnp.stack(all_hidden, axis=1)
+        hidden_cf = hidden_cf.reshape(batch_size, -1)
+        
+        belief_cf = jnp.stack(all_belief, axis=1)
+        belief_cf = belief_cf.reshape(batch_size, -1)
+        
+        # Only stack ToM predictions if they exist (not None when no_tom is disabled)
+        if all_tom_pred[0] is not None:
+            tom_pred_cf = jnp.stack(all_tom_pred, axis=1)
+            tom_pred_cf = tom_pred_cf.reshape(batch_size, -1)
+        else:
+            tom_pred_cf = None
     
     # Reshape to (num_agents, num_protos, num_envs, num_agents, ...)
     action_logits_cf = action_logits_cf.reshape(num_agents, num_protos, num_envs, num_agents, -1)
