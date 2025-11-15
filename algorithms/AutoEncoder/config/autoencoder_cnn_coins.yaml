@@ -1,0 +1,53 @@
+"LR": 0.0005
+"NUM_ENVS": 256
+"NUM_STEPS": 1000
+"TOTAL_TIMESTEPS": 2e7  # Each sweep run will train for 10M timesteps
+"UPDATE_EPOCHS": 2
+"NUM_MINIBATCHES": 500  # Must evenly divide NUM_ACTORS * NUM_STEPS (512*100=51200 or 1024*100=102400)
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"ENT_COEF": 0.01
+"VF_COEF": 0.5
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ENV_NAME": "coin_game"
+"REW_SHAPING_HORIZON": 2.5e6 # for how many timesteps add a shaping reward
+"SHAPING_BEGIN": 1e6
+"ENV_KWARGS": 
+  "num_agents" : 2
+  "num_inner_steps" : 1000
+  "shared_rewards" : False # Attention: switch to False for individual rewards 
+  "cnn" : True
+  "jit" : True
+  
+
+"ANNEAL_LR": True
+"SEED": 42  # Default seed (will be overridden by sweep when TUNE=True)
+"NUM_SEEDS": 1
+"TUNE": False  # Set to True to run non-PS ablation sweep (4 runs: 2×2 for SepReward×InfluenceTarget)
+
+"REWARD": "individual" # individual; common
+"GIF_NUM_FRAMES": 250  # Should be <= num_inner_steps (episode length)
+"PARAMETER_SHARING": False  # Recommended True for communication; False for independent agents
+
+# Communication Parameters
+"USE_COMM": True  # Set to True to use communication architecture
+"COMM_DIM": 64  # Dimension of communication vectors (must match with hidden_dim - embedding_dim)
+"NUM_PROTOS": 10  # Number of prototype communication symbols
+"HIDDEN_DIM": 128  # Hidden dimension for GRU (must be embedding_dim + comm_dim = 64 + 64)
+"COMM_MODE": "avg"  # Communication aggregation mode: 'avg' or 'sum'
+
+# AutoEncoder Parameters
+"AUTOENCODER_LOSS_COEF": 0.1  # Weight for autoencoder reconstruction loss (MSE between original and reconstructed embeddings)
+"USE_SEPARATE_REWARDS": False  # Autoencoder uses same reward for action and comm policies
+"COMM_LOSS_COEF": 0.1  # Weight for communication policy loss
+
+# WandB Params
+"ENTITY": ""
+"PROJECT": "socialjax"
+"WANDB_MODE" : "online"
+"WANDB_TAGS":
+  - INDIVIDUAL_REWARD # COMMON_REWARD
+  - AUTOENCODER_COMM
+

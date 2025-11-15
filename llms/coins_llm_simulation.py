@@ -22,6 +22,8 @@ import json
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import re
+import time
+from datetime import datetime
 
 import socialjax
 from socialjax.environments.coin_game.coin_game import CoinGame, Items, Actions
@@ -257,6 +259,110 @@ class ObservationDescriptor:
 
 
 # ============================================================================
+# EMBEDDING UTILITIES
+# ============================================================================
+
+def get_embedding(text: str, client: OpenAI, model: str = "text-embedding-3-large", dimensions: int = 64) -> List[float]:
+    """Get embedding vector for text using OpenAI API."""
+    try:
+        response = client.embeddings.create(
+            model=model,
+            input=text,
+            dimensions=dimensions
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Warning: Embedding failed: {e}")
+        return [0.0] * dimensions
+
+
+def find_closest_coin_in_fov(agent_x: int, agent_y: int, agent_direction: int, 
+                              grid: np.ndarray, agent_color: str) -> Optional[str]:
+    """
+    Find the closest coin in the agent's field of view.
+    
+    Returns:
+        "red", "green", or None if no coin in FOV
+    """
+    # FOV parameters
+    forward_range = 9
+    backward_range = 1
+    left_range = 5
+    right_range = 5
+    
+    def is_in_fov(obj_x: int, obj_y: int) -> Tuple[bool, float]:
+        """Check if object is in FOV and return distance."""
+        rel_x = obj_x - agent_x
+        rel_y = obj_y - agent_y
+        
+        # Transform based on direction
+        if agent_direction == 0:  # North
+            forward = rel_x
+            backward = -rel_x
+            left = rel_y
+            right = -rel_y
+        elif agent_direction == 1:  # West
+            forward = rel_y
+            backward = -rel_y
+            left = -rel_x
+            right = rel_x
+        elif agent_direction == 2:  # South
+            forward = -rel_x
+            backward = rel_x
+            left = -rel_y
+            right = rel_y
+        else:  # East
+            forward = -rel_y
+            backward = rel_y
+            left = rel_x
+            right = -rel_x
+        
+        in_forward = 0 <= forward <= forward_range
+        in_backward = 0 <= backward <= backward_range
+        in_left = 0 <= left <= left_range
+        in_right = 0 <= right <= right_range
+        
+        if (in_forward or in_backward) and (in_left or in_right):
+            distance = np.sqrt(rel_x**2 + rel_y**2)
+            return True, distance
+        return False, float('inf')
+    
+    closest_coin = None
+    closest_distance = float('inf')
+    
+    # Scan grid for coins
+    for x in range(grid.shape[0]):
+        for y in range(grid.shape[1]):
+            cell = grid[x, y]
+            if cell == 3:  # Red coin
+                in_fov, dist = is_in_fov(x, y)
+                if in_fov and dist < closest_distance:
+                    closest_distance = dist
+                    closest_coin = "red"
+            elif cell == 4:  # Green coin
+                in_fov, dist = is_in_fov(x, y)
+                if in_fov and dist < closest_distance:
+                    closest_distance = dist
+                    closest_coin = "green"
+    
+    return closest_coin
+
+
+def construct_semantic_key(agent_color: str, agent_x: int, agent_y: int, 
+                           closest_coin_color: Optional[str], agent_id: int, 
+                           action: str) -> Tuple:
+    """
+    Construct semantic representation key: (agent_color, agent_x, agent_y, 
+    closest_coin_color_in_fov, agent, action).
+    
+    No normalization - stores original values.
+    """
+    return (agent_color, int(agent_x), int(agent_y), 
+            closest_coin_color if closest_coin_color else "none", 
+            int(agent_id), action)
+
+
+# ============================================================================
 # LLM AGENT
 # ============================================================================
 
@@ -264,14 +370,34 @@ class LLMAgent:
     """LLM-powered agent that maintains belief state and generates actions."""
     
     def __init__(self, agent_id: int, team_color: str, model: str = "gpt-5-mini",
-                 temperature: float = 0.7):
+                 temperature: float = 0.7, reasoning: str = None):
         self.agent_id = agent_id
         self.team_color = team_color
-        self.client = OpenAI()  # Will use env variables OPENAI_API_KEY and OPENAI_BASE_URL
-        self.descriptor = ObservationDescriptor(agent_id, team_color)
-        self.belief_state = self._initialize_belief_state()
         self.model = model
         self.temperature = temperature
+        self.reasoning = reasoning  # For GPT-5.1: "none", "low", "medium", "high"
+        
+        # Use different endpoint and key for GPT-5.1
+        if self.model == "gpt-5.1":
+            gpt51_url = os.getenv("GPT_51_URL")
+            gpt51_key = os.getenv("GPT_51_KEY")
+            if gpt51_url and gpt51_key:
+                self.client = OpenAI(
+                    api_key=gpt51_key,
+                    base_url=gpt51_url
+                )
+            else:
+                raise ValueError(
+                    "GPT-5.1 requires GPT_51_URL and GPT_51_KEY environment variables. "
+                    f"GPT_51_URL={'set' if gpt51_url else 'not set'}, "
+                    f"GPT_51_KEY={'set' if gpt51_key else 'not set'}"
+                )
+        else:
+            # Default client uses OPENAI_API_KEY and OPENAI_BASE_URL
+            self.client = OpenAI()
+        
+        self.descriptor = ObservationDescriptor(agent_id, team_color)
+        self.belief_state = self._initialize_belief_state()
         
     def _initialize_belief_state(self) -> str:
         """Initialize agent's belief state."""
@@ -315,11 +441,25 @@ class LLMAgent:
         }
         
         # Call OpenAI API using responses.create
+        start_time = time.time()
         try:
-            response = self.client.responses.create(
-                    model=self.model,
-                    input=full_input,
-            )
+            # Build API call parameters
+            # Format: reasoning={ "effort": "low" | "medium" | "high" }
+            # Note: "none" means no reasoning parameter (default behavior)
+            api_params = {
+                "model": self.model,
+                "input": full_input,
+            }
+            
+            # Add reasoning parameter for GPT-5.1
+            # Only pass reasoning parameter for "low", "medium", or "high"
+            # "none" or None means use default (no reasoning parameter)
+            # Example: reasoning={ "effort": "low" }
+            if self.model == "gpt-5.1" and self.reasoning is not None and self.reasoning != "none":
+                if self.reasoning in ["low", "medium", "high"]:
+                    api_params["reasoning"] = {"effort": self.reasoning}
+            
+            response = self.client.responses.create(**api_params)
 
             # Extract output from response
             # Try multiple possible response formats
@@ -328,12 +468,19 @@ class LLMAgent:
             # Store raw data
             raw_data["llm_output"] = llm_output
             raw_data["api_response"] = self._serialize_api_response(response)
+            
+            # Extract token usage if available
+            elapsed_time = time.time() - start_time
+            raw_data["api_time"] = elapsed_time
+            raw_data["token_usage"] = self._extract_token_usage(response)
 
         except Exception as e:
             print(f"\nWarning: API call failed for Agent {self.agent_id}: {e}")
             llm_output = "BELIEF: Maintaining previous strategy.\nACTION: stay\nCOMMUNICATION: [No message]"
             raw_data["llm_output"] = llm_output
             raw_data["api_response"] = {"error": str(e)}
+            raw_data["api_time"] = time.time() - start_time
+            raw_data["token_usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
 
         # Parse output
@@ -360,6 +507,26 @@ class LLMAgent:
                 }
         except Exception as e:
             return {"error": f"Could not serialize response: {e}"}
+    
+    def _extract_token_usage(self, response) -> Dict:
+        """Extract token usage from API response."""
+        try:
+            if hasattr(response, 'usage'):
+                usage = response.usage
+                if hasattr(usage, 'model_dump'):
+                    return usage.model_dump()
+                elif hasattr(usage, 'to_dict'):
+                    return usage.to_dict()
+                else:
+                    return {
+                        "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
+                        "completion_tokens": getattr(usage, 'completion_tokens', 0),
+                        "total_tokens": getattr(usage, 'total_tokens', 0)
+                    }
+            else:
+                return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        except Exception as e:
+            return {"error": str(e), "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     
     def _build_system_prompt(self) -> str:
         """Build system prompt for the LLM."""
@@ -418,7 +585,7 @@ AVAILABLE ACTIONS:
 - stay: Stay in place
 
 OUTPUT FORMAT (must follow exactly):
-BELIEF: [One sentence describing your current understanding of the situation]
+BELIEF: [One sentence describing your current understanding of the situation including current positon ,next goal, and general game strategy.]
 ACTION: [One of: turn_left, turn_right, left, right, up, down, stay]
 COMMUNICATION: [Your message to the other agent, or "[No message]"]
 """
@@ -551,9 +718,9 @@ class CommunicationManager:
 # ============================================================================
 
 class TrajectoryLogger:
-    """Logs LLM outputs and environment trajectories for reproducibility and training."""
+    """Simplified logger that stores all data in a single JSON file."""
     
-    def __init__(self, save_dir: str, model: str, temperature: float, seed: int, num_agents: int):
+    def __init__(self, save_dir: str, model: str, temperature: float, seed: int, num_agents: int, embedding_client: OpenAI):
         """
         Initialize trajectory logger.
         
@@ -563,13 +730,17 @@ class TrajectoryLogger:
             temperature: Sampling temperature
             seed: Random seed
             num_agents: Number of agents
+            embedding_client: OpenAI client for embeddings
         """
         # Create experiment-specific subfolder
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         exp_name = f"{model}_temp{temperature}_seed{seed}_{timestamp}"
         self.save_dir = os.path.join(save_dir, exp_name)
         os.makedirs(self.save_dir, exist_ok=True)
+        
+        # Create subfolder for state visualizations
+        self.state_vis_dir = os.path.join(self.save_dir, "state_visualizations")
+        os.makedirs(self.state_vis_dir, exist_ok=True)
         
         # Metadata
         self.metadata = {
@@ -581,46 +752,30 @@ class TrajectoryLogger:
             "timestamp": timestamp
         }
         
-        # Raw trajectory (full LLM outputs and env states)
-        self.raw_trajectory = {
+        # Single trajectory data structure
+        self.trajectory = {
             "metadata": self.metadata,
             "trajectory": []
-        }
-        
-        # Parsed trajectory (for RL/IL training)
-        self.parsed_trajectory = {
-            "metadata": self.metadata,
-            "trajectory": []
-        }
-        
-        # Human-readable debug log
-        self.human_readable_log = {
-            "metadata": self.metadata,
-            "timesteps": []
-        }
-        
-        # Interaction history (all communications between agents)
-        self.interaction_history = {
-            "metadata": self.metadata,
-            "interactions": []
         }
         
         # Performance tracking
         self.cumulative_rewards = [0.0] * num_agents
         self.episode_lengths = 0
+        self.total_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.total_api_time = 0.0
         
-        # Additional metrics tracking for visualization
-        self.accumulated_rewards_history = []  # List of arrays [timestep, agent_rewards]
-        self.coins_in_state_history = []  # List of [red_coins, green_coins] counts
-        self.own_color_eaten_history = []  # List of arrays [agent_own_coins_eaten]
-        self.other_color_eaten_history = []  # List of arrays [agent_other_coins_eaten]
+        # Embedding client (not used during collection, but kept for compatibility)
+        self.embedding_client = embedding_client
         
-        # Log file handle for per-timestep logging
-        self.timestep_log_path = os.path.join(self.save_dir, "timestep_log.txt")
-        self.timestep_log = open(self.timestep_log_path, 'w')
-        self.timestep_log.write(f"Experiment: {exp_name}\n")
-        self.timestep_log.write(f"Model: {model}, Temperature: {temperature}, Seed: {seed}\n")
-        self.timestep_log.write("="*80 + "\n\n")
+        # Performance profiling
+        self.timestep_times = []
+        self.api_call_times = []
+        self.observation_times = []
+        self.logging_times = []
+        
+        # Paths for incremental saving
+        self.temp_json_path = os.path.join(self.save_dir, "trajectory_temp.json")
+        self.last_saved_timestep = -1
         
     def log_timestep(self, timestep: int, 
                     agents_data: List[Dict],
@@ -628,133 +783,122 @@ class TrajectoryLogger:
                     env_state,
                     rewards: np.ndarray,
                     cumulative_own_eaten: np.ndarray = None,
-                    cumulative_other_eaten: np.ndarray = None):
+                    cumulative_other_eaten: np.ndarray = None,
+                    agent_colors: List[str] = None,
+                    observation_state=None):
         """
-        Log a complete timestep with all agent and environment data.
+        Log a complete timestep with all agent and environment data, including embeddings.
         
         Args:
             timestep: Current timestep number
-            agents_data: List of dicts containing per-agent data:
-                - llm_input: Full input prompt to LLM
-                - llm_output: Raw LLM response text
-                - api_response: Full API response object (optional)
-                - observation: Natural language observation
-                - belief: Parsed belief state
-                - action: Parsed action string
-                - action_idx: Action index
-                - communication: Parsed communication message
-                - received_messages: List of messages received
-            env_obs: Environment observations (JAX array)
-            env_state: Full environment state
-            rewards: Reward array
+            agents_data: List of dicts containing per-agent data
+            env_obs: Environment observations (JAX array) - observations at timestep t
+            env_state: Full environment state - state at t+1 (result of action at t)
+            rewards: Reward array - rewards at t+1 (result of action at t)
+            cumulative_own_eaten: Cumulative own-color coins eaten
+            cumulative_other_eaten: Cumulative other-color coins eaten
+            agent_colors: List of agent colors ["red", "green"]
+            observation_state: State at timestep t (the state the observation describes)
         """
-        # Log raw data (full LLM outputs and complete environment state)
-        raw_step = {
+        grid = np.array(env_state.grid)
+        red_coins = np.sum(grid == 3)
+        green_coins = np.sum(grid == 4)
+        
+        # Use observation_state for semantic key construction (state at t), env_state for logging (state at t+1)
+        state_for_semantic = observation_state if observation_state is not None else env_state
+        
+        step_data = {
             "timestep": timestep,
             "agents": [],
-            "env_state": self._serialize_env_state(env_state),
+            "env_state": self._serialize_env_state(env_state),  # State at t+1
             "env_obs": self._serialize_array(env_obs),
-            "rewards": self._serialize_array(rewards)
-        }
-        
-        # Log parsed data (structured for RL/IL training)
-        parsed_step = {
-            "timestep": timestep,
-            "agents": [],
-            "env_obs": self._serialize_array(env_obs),
-            "env_state_compact": {
-                "agent_locs": self._serialize_array(env_state.agent_locs),
-                "grid": self._serialize_array(env_state.grid)
-            }
-        }
-        
-        for agent_data in agents_data:
-            # Raw agent data - capture EVERYTHING
-            raw_agent = {
-                "agent_id": agent_data.get("agent_id"),
-                "llm_input": agent_data.get("llm_input", ""),
-                "llm_output": agent_data.get("llm_output", ""),
-                "api_response": agent_data.get("api_response"),
-                "observation": agent_data.get("observation", ""),
-                "belief": agent_data.get("belief", ""),
-                "action": agent_data.get("action", "stay"),
-                "action_idx": agent_data.get("action_idx", 6),
-                "communication": agent_data.get("communication", "[No message]"),
-                "received_messages": agent_data.get("received_messages", [])
-            }
-            raw_step["agents"].append(raw_agent)
-            
-            # Track interactions (communications)
-            if agent_data.get("communication") and agent_data.get("communication") != "[No message]":
-                self.interaction_history["interactions"].append({
-                    "timestep": timestep,
-                    "sender_id": agent_data.get("agent_id"),
-                    "message": agent_data.get("communication"),
-                    "receiver_ids": [i for i in range(self.metadata["num_agents"]) if i != agent_data.get("agent_id")]
-                })
-            
-            # Parsed agent data
-            parsed_agent = {
-                "agent_id": agent_data.get("agent_id"),
-                "observation": agent_data.get("observation", ""),
-                "belief": agent_data.get("belief", ""),
-                "action": agent_data.get("action", "stay"),
-                "action_idx": agent_data.get("action_idx", 6),
-                "communication": agent_data.get("communication", "[No message]"),
-                "received_messages": agent_data.get("received_messages", []),
-                "reward": float(rewards[agent_data.get("agent_id", 0)])
-            }
-            parsed_step["agents"].append(parsed_agent)
-        
-        self.raw_trajectory["trajectory"].append(raw_step)
-        self.parsed_trajectory["trajectory"].append(parsed_step)
-        
-        # Build human-readable log entry (only interpretable information)
-        human_step = {
-            "timestep": timestep,
-            "agents": []
+            "rewards": self._serialize_array(rewards),  # Rewards at t+1
+            "coins_in_env": {"red": int(red_coins), "green": int(green_coins)},
+            "accumulated_rewards": [float(r) for r in self.cumulative_rewards],
+            "cumulative_own_eaten": cumulative_own_eaten.tolist() if cumulative_own_eaten is not None else None,
+            "cumulative_other_eaten": cumulative_other_eaten.tolist() if cumulative_other_eaten is not None else None
         }
         
         for agent_data in agents_data:
             agent_id = agent_data.get("agent_id")
-            human_agent = {
+            # Use observation_state for semantic key (state at t that observation describes)
+            semantic_grid = np.array(state_for_semantic.grid)
+            agent_x = int(state_for_semantic.agent_locs[agent_id][0])
+            agent_y = int(state_for_semantic.agent_locs[agent_id][1])
+            agent_direction = int(state_for_semantic.agent_locs[agent_id][2])
+            agent_color = agent_colors[agent_id] if agent_colors else ("red" if agent_id == 0 else "green")
+            
+            # Find closest coin in FOV (using state at t)
+            closest_coin = find_closest_coin_in_fov(agent_x, agent_y, agent_direction, semantic_grid, agent_color)
+            
+            # Construct semantic key
+            semantic_key = construct_semantic_key(
+                agent_color, agent_x, agent_y, closest_coin, agent_id, 
+                agent_data.get("action", "stay")
+            )
+            
+            # Save original text instead of embeddings (embeddings can be computed later)
+            belief_text = agent_data.get("belief", "")
+            comm_text = agent_data.get("communication", "[No message]")
+            
+            # Extract token usage and time
+            token_usage = agent_data.get("token_usage", {})
+            api_time = agent_data.get("api_time", 0.0)
+            
+            # Track API call times
+            if api_time > 0:
+                self.api_call_times.append(api_time)
+            
+            # Update totals
+            if isinstance(token_usage, dict):
+                self.total_token_usage["prompt_tokens"] += token_usage.get("prompt_tokens", 0)
+                self.total_token_usage["completion_tokens"] += token_usage.get("completion_tokens", 0)
+                self.total_token_usage["total_tokens"] += token_usage.get("total_tokens", 0)
+            self.total_api_time += api_time
+            
+            agent_entry = {
                 "agent_id": agent_id,
-                "position": self._serialize_array(env_state.agent_locs[agent_id][:2]),  # x, y only
-                "facing_direction": ["North", "West", "South", "East"][int(env_state.agent_locs[agent_id][2])],
+                "agent_color": agent_color,
                 "observation": agent_data.get("observation", ""),
-                "received_messages": agent_data.get("received_messages", []),
-                "belief": agent_data.get("belief", ""),
+                "belief": belief_text,  # Original text, no embedding
                 "action": agent_data.get("action", "stay"),
-                "communication": agent_data.get("communication", "[No message]"),
-                "reward": float(rewards[agent_id])
+                "action_idx": agent_data.get("action_idx", 6),
+                "communication": comm_text,  # Original text, no embedding
+                "received_messages": agent_data.get("received_messages", []),
+                "reward": float(rewards[agent_id]),
+                "semantic_key": semantic_key,
+                "token_usage": token_usage,
+                "api_time": api_time,
+                "position": [agent_x, agent_y],
+                "direction": agent_direction
             }
-            human_step["agents"].append(human_agent)
+            step_data["agents"].append(agent_entry)
         
-        self.human_readable_log["timesteps"].append(human_step)
-        
-        # Write to per-timestep log file
-        self._write_timestep_to_file(timestep, human_step, rewards)
+        self.trajectory["trajectory"].append(step_data)
         
         # Update performance tracking
         for i, r in enumerate(rewards):
             self.cumulative_rewards[i] += r
         self.episode_lengths += 1
         
-        # Track additional metrics
-        # Accumulated rewards at this timestep
-        self.accumulated_rewards_history.append(np.array(self.cumulative_rewards.copy()))
-        
-        # Count coins in state (3 = red coin, 4 = green coin)
-        grid = np.array(env_state.grid)
-        red_coins = np.sum(grid == 3)
-        green_coins = np.sum(grid == 4)
-        self.coins_in_state_history.append([red_coins, green_coins])
-        
-        # Track own/other color coins eaten (cumulative)
-        if cumulative_own_eaten is not None:
-            self.own_color_eaten_history.append(cumulative_own_eaten.copy())
-        if cumulative_other_eaten is not None:
-            self.other_color_eaten_history.append(cumulative_other_eaten.copy())
+        # Incremental save after each timestep
+        self._save_incremental()
+    
+    def _save_incremental(self):
+        """Save trajectory incrementally to temp file after each timestep."""
+        try:
+            # Add current metadata
+            self.trajectory["metadata"]["total_timesteps"] = self.episode_lengths
+            self.trajectory["metadata"]["total_token_usage"] = self.total_token_usage
+            self.trajectory["metadata"]["total_api_time"] = self.total_api_time
+            
+            # Save to temp file (use compact format for speed)
+            with open(self.temp_json_path, 'w') as f:
+                json.dump(self.trajectory, f, separators=(',', ':'))  # Compact format, faster
+            
+            self.last_saved_timestep = self.episode_lengths - 1
+        except Exception as e:
+            print(f"Warning: Failed to save incremental data: {e}")
     
     def _serialize_array(self, arr) -> List:
         """Convert JAX/numpy array to nested list for JSON serialization."""
@@ -773,161 +917,191 @@ class TrajectoryLogger:
                 state_dict[field] = value
         return state_dict
     
-    def _write_timestep_to_file(self, timestep: int, human_step: Dict, rewards: np.ndarray):
-        """Write human-readable timestep to log file."""
-        self.timestep_log.write(f"TIMESTEP {timestep}\n")
-        self.timestep_log.write("-" * 80 + "\n")
-        
-        for agent_data in human_step["agents"]:
-            agent_id = agent_data["agent_id"]
-            self.timestep_log.write(f"\nAgent {agent_id}:\n")
-            self.timestep_log.write(f"  Position: {agent_data['position']}, Facing: {agent_data['facing_direction']}\n")
-            self.timestep_log.write(f"  Reward: {agent_data['reward']:.2f}\n")
-            
-            # Observation (truncated)
-            obs_preview = agent_data['observation'][:150] + "..." if len(agent_data['observation']) > 150 else agent_data['observation']
-            self.timestep_log.write(f"  Observation: {obs_preview}\n")
-            
-            # Received messages
-            if agent_data['received_messages']:
-                self.timestep_log.write(f"  Received: {agent_data['received_messages']}\n")
-            
-            # Belief
-            self.timestep_log.write(f"  Belief: {agent_data['belief']}\n")
-            
-            # Action
-            self.timestep_log.write(f"  Action: {agent_data['action']}\n")
-            
-            # Communication
-            if agent_data['communication'] != "[No message]":
-                self.timestep_log.write(f"  Communication: {agent_data['communication']}\n")
-        
-        self.timestep_log.write("\n" + "=" * 80 + "\n\n")
-        self.timestep_log.flush()  # Ensure it's written immediately
-    
     def save(self):
-        """Save all trajectory files."""
-        # Close timestep log file
-        self.timestep_log.close()
+        """Save trajectory data to single JSON file and summary text file."""
+        # Add summary statistics to trajectory metadata
+        self.trajectory["metadata"]["total_timesteps"] = self.episode_lengths
+        self.trajectory["metadata"]["total_token_usage"] = self.total_token_usage
+        self.trajectory["metadata"]["total_api_time"] = self.total_api_time
         
-        # Save raw trajectory (complete raw data from LLMs and environment)
-        raw_path = os.path.join(self.save_dir, "trajectory_raw.json")
-        with open(raw_path, 'w') as f:
-            json.dump(self.raw_trajectory, f, indent=2)
+        # Add performance profiling data
+        if self.timestep_times:
+            self.trajectory["metadata"]["performance"] = {
+                "avg_timestep_time": np.mean(self.timestep_times),
+                "avg_api_time": np.mean(self.api_call_times) if self.api_call_times else 0.0,
+                "avg_observation_time": np.mean(self.observation_times) if self.observation_times else 0.0,
+                "avg_logging_time": np.mean(self.logging_times) if self.logging_times else 0.0,
+                "total_timesteps": len(self.timestep_times)
+            }
         
-        # Save parsed trajectory (structured for RL/IL training)
-        parsed_path = os.path.join(self.save_dir, "trajectory_parsed.json")
-        with open(parsed_path, 'w') as f:
-            json.dump(self.parsed_trajectory, f, indent=2)
+        # Save single JSON file (rename from temp if exists)
+        json_path = os.path.join(self.save_dir, "trajectory.json")
+        if os.path.exists(self.temp_json_path):
+            import shutil
+            shutil.move(self.temp_json_path, json_path)
+        else:
+            with open(json_path, 'w') as f:
+                json.dump(self.trajectory, f, indent=2)
         
-        # Save human-readable debug log
-        human_path = os.path.join(self.save_dir, "debug_human_readable.json")
-        with open(human_path, 'w') as f:
-            json.dump(self.human_readable_log, f, indent=2)
-        
-        # Save interaction history
-        interaction_path = os.path.join(self.save_dir, "interaction_history.json")
-        with open(interaction_path, 'w') as f:
-            json.dump(self.interaction_history, f, indent=2)
-        
-        # Save statistics
-        stats = self._compute_statistics()
-        stats_path = os.path.join(self.save_dir, "trajectory_stats.json")
-        with open(stats_path, 'w') as f:
-            json.dump(stats, f, indent=2)
-        
-        # Generate and save human-readable summary
-        summary = self._generate_human_summary(stats)
-        summary_path = os.path.join(self.save_dir, "human_summary.txt")
+        # Generate and save summary text file
+        summary = self._generate_summary()
+        summary_path = os.path.join(self.save_dir, "summary.txt")
         with open(summary_path, 'w') as f:
             f.write(summary)
         
-        # Generate and save interaction history as text
-        interaction_text = self._generate_interaction_history_text()
-        interaction_text_path = os.path.join(self.save_dir, "interaction_history.txt")
-        with open(interaction_text_path, 'w') as f:
-            f.write(interaction_text)
-        
-        # Generate and save file manifest
-        manifest = self._generate_file_manifest()
-        manifest_path = os.path.join(self.save_dir, "FILE_MANIFEST.txt")
-        with open(manifest_path, 'w') as f:
-            f.write(manifest)
-        
-        # Save additional metrics as numpy arrays for visualization
-        if self.accumulated_rewards_history:
-            accumulated_rewards_array = np.array(self.accumulated_rewards_history)  # Shape: (timesteps, num_agents)
-            np.save(os.path.join(self.save_dir, "accumulated_rewards.npy"), accumulated_rewards_array)
-        
-        if self.coins_in_state_history:
-            coins_in_state_array = np.array(self.coins_in_state_history)  # Shape: (timesteps, 2) [red, green]
-            np.save(os.path.join(self.save_dir, "coins_in_state.npy"), coins_in_state_array)
-        
-        if self.own_color_eaten_history:
-            own_color_eaten_array = np.array(self.own_color_eaten_history)  # Shape: (timesteps, num_agents)
-            np.save(os.path.join(self.save_dir, "own_color_coins_eaten.npy"), own_color_eaten_array)
-        
-        if self.other_color_eaten_history:
-            other_color_eaten_array = np.array(self.other_color_eaten_history)  # Shape: (timesteps, num_agents)
-            np.save(os.path.join(self.save_dir, "other_color_coins_eaten.npy"), other_color_eaten_array)
-        
-        # Print summary of saved files
         print(f"\nSaved trajectory data to: {self.save_dir}")
         print("Files saved:")
-        print("  - trajectory_raw.json (complete raw LLM and environment data)")
-        print("  - trajectory_parsed.json (structured data for training)")
-        print("  - timestep_log.txt (detailed per-timestep log)")
-        print("  - human_summary.txt (comprehensive summary)")
-        print("  - interaction_history.txt (communication log)")
-        print("  - interaction_history.json (structured interactions)")
-        print("  - trajectory_stats.json (performance statistics)")
-        print("  - debug_human_readable.json (human-readable JSON)")
-        print("  - FILE_MANIFEST.txt (file documentation)")
-        print(f"  - {self.episode_lengths} PNG files (timestep_XXXX.png)")
+        print("  - trajectory.json (complete trajectory with text data)")
+        print("  - summary.txt (aggregated statistics)")
+        print(f"  - state_visualizations/ (state visualization images)")
         print("  - simulation.gif (animated visualization)")
-        print("  - accumulated_rewards.npy (cumulative rewards per agent over time)")
-        print("  - coins_in_state.npy (coin counts in environment over time)")
-        print("  - own_color_coins_eaten.npy (cumulative own-color coins eaten)")
-        print("  - other_color_coins_eaten.npy (cumulative other-color coins eaten)")
-    
-    def _compute_statistics(self) -> Dict:
-        """Compute statistics from the parsed trajectory."""
-        stats = {
-            "metadata": self.metadata,
-            "total_timesteps": len(self.parsed_trajectory["trajectory"]),
-            "episode_length": self.episode_lengths,
-            "agents": []
-        }
         
-        for agent_id in range(self.metadata["num_agents"]):
-            agent_stats = {
-                "agent_id": agent_id,
-                "total_reward": 0.0,
-                "average_return": 0.0,
-                "action_distribution": {},
-                "num_communications": 0,
-                "avg_belief_length": 0.0
-            }
+        # Print performance summary with bottleneck identification
+        if self.timestep_times:
+            print("\nPerformance Summary:")
+            avg_timestep = np.mean(self.timestep_times)
+            print(f"  Average timestep time: {avg_timestep:.3f}s")
             
-            belief_lengths = []
-            for step in self.parsed_trajectory["trajectory"]:
-                agent_data = step["agents"][agent_id]
-                agent_stats["total_reward"] += agent_data["reward"]
-                
-                action = agent_data["action"]
-                agent_stats["action_distribution"][action] = \
-                    agent_stats["action_distribution"].get(action, 0) + 1
+            if self.api_call_times:
+                avg_api = np.mean(self.api_call_times)
+                api_percentage = (sum(self.api_call_times) / sum(self.timestep_times)) * 100
+                print(f"  Average API call time: {avg_api:.3f}s ({api_percentage:.1f}% of total)")
+                print(f"    → API calls are the main bottleneck" if api_percentage > 50 else "")
+            
+            if self.observation_times:
+                avg_obs = np.mean(self.observation_times)
+                obs_percentage = (sum(self.observation_times) / sum(self.timestep_times)) * 100
+                print(f"  Average observation generation time: {avg_obs:.3f}s ({obs_percentage:.1f}% of total)")
+            
+            if self.logging_times:
+                avg_log = np.mean(self.logging_times)
+                log_percentage = (sum(self.logging_times) / sum(self.timestep_times)) * 100
+                print(f"  Average logging time: {avg_log:.3f}s ({log_percentage:.1f}% of total)")
+            
+            # Identify bottleneck
+            percentages = {}
+            if self.api_call_times:
+                percentages["API calls"] = (sum(self.api_call_times) / sum(self.timestep_times)) * 100
+            if self.observation_times:
+                percentages["Observation generation"] = (sum(self.observation_times) / sum(self.timestep_times)) * 100
+            if self.logging_times:
+                percentages["Logging"] = (sum(self.logging_times) / sum(self.timestep_times)) * 100
+            
+            if percentages:
+                bottleneck = max(percentages.items(), key=lambda x: x[1])
+                print(f"\n  ⚠️  Performance Bottleneck: {bottleneck[0]} ({bottleneck[1]:.1f}% of total time)")
+    
+    def _generate_summary(self) -> str:
+        """Generate summary text file with aggregated statistics."""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("SIMULATION SUMMARY")
+        lines.append("=" * 80)
+        lines.append("")
+        
+        # Metadata
+        lines.append("EXPERIMENT METADATA:")
+        lines.append(f"  Model: {self.metadata['model']}")
+        lines.append(f"  Temperature: {self.metadata['temperature']}")
+        lines.append(f"  Seed: {self.metadata['seed']}")
+        lines.append(f"  Timestamp: {self.metadata['timestamp']}")
+        lines.append(f"  Total Timesteps: {self.episode_lengths}")
+        lines.append("")
+        
+        # Token usage and time
+        lines.append("=" * 80)
+        lines.append("TOKEN USAGE AND TIME")
+        lines.append("=" * 80)
+        lines.append(f"  Total Prompt Tokens: {self.total_token_usage['prompt_tokens']}")
+        lines.append(f"  Total Completion Tokens: {self.total_token_usage['completion_tokens']}")
+        lines.append(f"  Total Tokens: {self.total_token_usage['total_tokens']}")
+        lines.append(f"  Total API Time: {self.total_api_time:.2f} seconds")
+        lines.append(f"  Average Time per Timestep: {self.total_api_time / max(self.episode_lengths, 1):.3f} seconds")
+        lines.append("")
+        
+        # Performance profiling
+        if self.timestep_times:
+            lines.append("=" * 80)
+            lines.append("PERFORMANCE PROFILING")
+            lines.append("=" * 80)
+            lines.append(f"  Average Timestep Time: {np.mean(self.timestep_times):.3f} seconds")
+            if self.api_call_times:
+                lines.append(f"  Average API Call Time: {np.mean(self.api_call_times):.3f} seconds")
+                lines.append(f"  Total API Calls: {len(self.api_call_times)}")
+                lines.append(f"  API Time Percentage: {(sum(self.api_call_times) / sum(self.timestep_times) * 100):.1f}%")
+            if self.observation_times:
+                lines.append(f"  Average Observation Generation Time: {np.mean(self.observation_times):.3f} seconds")
+            if self.logging_times:
+                lines.append(f"  Average Logging Time: {np.mean(self.logging_times):.3f} seconds")
+            lines.append("")
+        
+        # Agent performance
+        lines.append("=" * 80)
+        lines.append("AGENT PERFORMANCE")
+        lines.append("=" * 80)
+        
+        # Compute statistics from trajectory
+        agent_stats = {i: {
+            "total_reward": 0.0,
+            "num_communications": 0,
+            "action_distribution": {},
+            "total_own_eaten": 0,
+            "total_other_eaten": 0
+        } for i in range(self.metadata["num_agents"])}
+        
+        for step in self.trajectory["trajectory"]:
+            for agent_data in step["agents"]:
+                agent_id = agent_data["agent_id"]
+                agent_stats[agent_id]["total_reward"] += agent_data["reward"]
                 
                 if agent_data["communication"] != "[No message]":
-                    agent_stats["num_communications"] += 1
+                    agent_stats[agent_id]["num_communications"] += 1
                 
-                belief_lengths.append(len(agent_data["belief"]))
-            
-            agent_stats["avg_belief_length"] = np.mean(belief_lengths) if belief_lengths else 0.0
-            agent_stats["average_return"] = agent_stats["total_reward"] / max(self.episode_lengths, 1)
-            stats["agents"].append(agent_stats)
+                action = agent_data["action"]
+                agent_stats[agent_id]["action_distribution"][action] = \
+                    agent_stats[agent_id]["action_distribution"].get(action, 0) + 1
         
-        return stats
+        # Get final cumulative eaten values
+        if self.trajectory["trajectory"]:
+            final_step = self.trajectory["trajectory"][-1]
+            if final_step.get("cumulative_own_eaten"):
+                for i, val in enumerate(final_step["cumulative_own_eaten"]):
+                    agent_stats[i]["total_own_eaten"] = val
+            if final_step.get("cumulative_other_eaten"):
+                for i, val in enumerate(final_step["cumulative_other_eaten"]):
+                    agent_stats[i]["total_other_eaten"] = val
+        
+        for agent_id in range(self.metadata["num_agents"]):
+            stats = agent_stats[agent_id]
+            lines.append(f"\nAgent {agent_id}:")
+            lines.append(f"  Total Reward: {stats['total_reward']:.2f}")
+            lines.append(f"  Average Return per Timestep: {stats['total_reward'] / max(self.episode_lengths, 1):.4f}")
+            lines.append(f"  Number of Communications Sent: {stats['num_communications']}")
+            lines.append(f"  Total Own-Color Coins Eaten: {stats['total_own_eaten']:.0f}")
+            lines.append(f"  Total Other-Color Coins Eaten: {stats['total_other_eaten']:.0f}")
+            lines.append("  Action Distribution:")
+            for action, count in sorted(stats['action_distribution'].items(), 
+                                       key=lambda x: x[1], reverse=True):
+                percentage = (count / self.episode_lengths) * 100 if self.episode_lengths > 0 else 0
+                lines.append(f"    {action}: {count} times ({percentage:.1f}%)")
+        lines.append("")
+        
+        # Environment metrics
+        lines.append("=" * 80)
+        lines.append("ENVIRONMENT METRICS")
+        lines.append("=" * 80)
+        if self.trajectory["trajectory"]:
+            # Average coins in environment
+            total_red = sum(step["coins_in_env"]["red"] for step in self.trajectory["trajectory"])
+            total_green = sum(step["coins_in_env"]["green"] for step in self.trajectory["trajectory"])
+            avg_red = total_red / len(self.trajectory["trajectory"])
+            avg_green = total_green / len(self.trajectory["trajectory"])
+            lines.append(f"  Average Red Coins in Environment: {avg_red:.2f}")
+            lines.append(f"  Average Green Coins in Environment: {avg_green:.2f}")
+        lines.append("")
+        lines.append("=" * 80)
+        
+        return "\n".join(lines)
     
     def print_performance(self):
         """Print performance summary."""
@@ -945,217 +1119,6 @@ class TrajectoryLogger:
         
         print("="*70)
     
-    def _generate_human_summary(self, stats: Dict) -> str:
-        """Generate a comprehensive human-readable summary of the simulation."""
-        lines = []
-        lines.append("=" * 80)
-        lines.append("SIMULATION SUMMARY")
-        lines.append("=" * 80)
-        lines.append("")
-        
-        # Metadata
-        lines.append("EXPERIMENT METADATA:")
-        lines.append(f"  Model: {self.metadata['model']}")
-        lines.append(f"  Temperature: {self.metadata['temperature']}")
-        lines.append(f"  Seed: {self.metadata['seed']}")
-        lines.append(f"  Timestamp: {self.metadata['timestamp']}")
-        lines.append(f"  Total Timesteps: {stats['total_timesteps']}")
-        lines.append(f"  Episode Length: {stats['episode_length']}")
-        lines.append("")
-        
-        # Agent performance
-        lines.append("=" * 80)
-        lines.append("AGENT PERFORMANCE")
-        lines.append("=" * 80)
-        for agent_stats in stats['agents']:
-            agent_id = agent_stats['agent_id']
-            lines.append(f"\nAgent {agent_id}:")
-            lines.append(f"  Total Reward: {agent_stats['total_reward']:.2f}")
-            lines.append(f"  Average Return per Timestep: {agent_stats['average_return']:.4f}")
-            lines.append(f"  Number of Communications Sent: {agent_stats['num_communications']}")
-            lines.append(f"  Average Belief Length: {agent_stats['avg_belief_length']:.1f} characters")
-            lines.append("")
-            lines.append("  Action Distribution:")
-            for action, count in sorted(agent_stats['action_distribution'].items(), 
-                                       key=lambda x: x[1], reverse=True):
-                percentage = (count / stats['total_timesteps']) * 100
-                lines.append(f"    {action}: {count} times ({percentage:.1f}%)")
-        lines.append("")
-        
-        # Interaction summary
-        lines.append("=" * 80)
-        lines.append("COMMUNICATION SUMMARY")
-        lines.append("=" * 80)
-        total_interactions = len(self.interaction_history['interactions'])
-        lines.append(f"Total Communications: {total_interactions}")
-        
-        if total_interactions > 0:
-            # Count by sender
-            comms_by_agent = {}
-            for interaction in self.interaction_history['interactions']:
-                sender = interaction['sender_id']
-                comms_by_agent[sender] = comms_by_agent.get(sender, 0) + 1
-            
-            lines.append("\nCommunications by Agent:")
-            for agent_id in sorted(comms_by_agent.keys()):
-                lines.append(f"  Agent {agent_id}: {comms_by_agent[agent_id]} messages")
-        else:
-            lines.append("\nNo communications occurred during this simulation.")
-        lines.append("")
-        
-        # Key events timeline
-        lines.append("=" * 80)
-        lines.append("KEY EVENTS TIMELINE")
-        lines.append("=" * 80)
-        
-        # Find timesteps with significant events
-        significant_events = []
-        for step in self.human_readable_log['timesteps']:
-            timestep = step['timestep']
-            events = []
-            
-            for agent_data in step['agents']:
-                # Check for communications
-                if agent_data['communication'] != "[No message]":
-                    events.append(f"Agent {agent_data['agent_id']} sent message: '{agent_data['communication'][:50]}...'")
-                
-                # Check for high rewards
-                if abs(agent_data['reward']) > 0.5:
-                    events.append(f"Agent {agent_data['agent_id']} received reward: {agent_data['reward']:.2f}")
-            
-            if events:
-                significant_events.append((timestep, events))
-        
-        if significant_events:
-            for timestep, events in significant_events[:20]:  # Show first 20 significant events
-                lines.append(f"\nTimestep {timestep}:")
-                for event in events:
-                    lines.append(f"  - {event}")
-        else:
-            lines.append("\nNo significant events detected.")
-        lines.append("")
-        
-        # Final state
-        if self.human_readable_log['timesteps']:
-            final_step = self.human_readable_log['timesteps'][-1]
-            lines.append("=" * 80)
-            lines.append("FINAL STATE")
-            lines.append("=" * 80)
-            for agent_data in final_step['agents']:
-                lines.append(f"\nAgent {agent_data['agent_id']}:")
-                lines.append(f"  Position: {agent_data['position']}")
-                lines.append(f"  Facing: {agent_data['facing_direction']}")
-                lines.append(f"  Final Belief: {agent_data['belief'][:200]}...")
-        lines.append("")
-        lines.append("=" * 80)
-        
-        return "\n".join(lines)
-    
-    def _generate_interaction_history_text(self) -> str:
-        """Generate human-readable interaction history."""
-        lines = []
-        lines.append("=" * 80)
-        lines.append("INTERACTION HISTORY")
-        lines.append("=" * 80)
-        lines.append("")
-        lines.append(f"Total Interactions: {len(self.interaction_history['interactions'])}")
-        lines.append("")
-        
-        if not self.interaction_history['interactions']:
-            lines.append("No interactions (communications) occurred during this simulation.")
-            return "\n".join(lines)
-        
-        # Group by timestep
-        current_timestep = None
-        for interaction in self.interaction_history['interactions']:
-            timestep = interaction['timestep']
-            if timestep != current_timestep:
-                if current_timestep is not None:
-                    lines.append("")
-                lines.append(f"--- Timestep {timestep} ---")
-                current_timestep = timestep
-            
-            sender = interaction['sender_id']
-            message = interaction['message']
-            receivers = interaction['receiver_ids']
-            
-            receiver_str = ", ".join([f"Agent {r}" for r in receivers])
-            lines.append(f"  Agent {sender} → {receiver_str}:")
-            lines.append(f"    \"{message}\"")
-        
-        lines.append("")
-        lines.append("=" * 80)
-        
-        return "\n".join(lines)
-    
-    def _generate_file_manifest(self) -> str:
-        """Generate a manifest documenting all saved files."""
-        lines = []
-        lines.append("=" * 80)
-        lines.append("FILE MANIFEST")
-        lines.append("=" * 80)
-        lines.append("")
-        lines.append("This directory contains all data from the LLM agent simulation.")
-        lines.append("")
-        
-        lines.append("RAW DATA FILES:")
-        lines.append("  - trajectory_raw.json: Complete raw data including:")
-        lines.append("      * Full LLM inputs (prompts) for each agent at each timestep")
-        lines.append("      * Full LLM outputs (raw responses) for each agent")
-        lines.append("      * Complete API responses from OpenAI")
-        lines.append("      * All observations, beliefs, actions, communications")
-        lines.append("      * Complete environment state (grid, agent locations, etc.)")
-        lines.append("      * Environment observations (JAX arrays)")
-        lines.append("      * Rewards for each timestep")
-        lines.append("")
-        
-        lines.append("PARSED DATA FILES:")
-        lines.append("  - trajectory_parsed.json: Structured data for RL/IL training:")
-        lines.append("      * Parsed observations, beliefs, actions, communications")
-        lines.append("      * Compact environment state")
-        lines.append("      * Action indices and rewards")
-        lines.append("")
-        
-        lines.append("HUMAN-READABLE FILES:")
-        lines.append("  - timestep_log.txt: Detailed per-timestep log with all agent information")
-        lines.append("  - human_summary.txt: Comprehensive summary with:")
-        lines.append("      * Experiment metadata")
-        lines.append("      * Agent performance statistics")
-        lines.append("      * Communication summary")
-        lines.append("      * Key events timeline")
-        lines.append("      * Final state information")
-        lines.append("  - interaction_history.txt: Chronological log of all communications")
-        lines.append("  - interaction_history.json: Structured JSON of all interactions")
-        lines.append("  - debug_human_readable.json: Human-readable JSON format of trajectory")
-        lines.append("")
-        
-        lines.append("STATISTICS FILES:")
-        lines.append("  - trajectory_stats.json: Performance statistics including:")
-        lines.append("      * Total and average rewards per agent")
-        lines.append("      * Action distributions")
-        lines.append("      * Communication counts")
-        lines.append("      * Average belief lengths")
-        lines.append("")
-        
-        lines.append("VISUALIZATION FILES:")
-        lines.append("  - timestep_XXXX.png: PNG image for each timestep showing:")
-        lines.append("      * Game state visualization")
-        lines.append("      * Agent observations, beliefs, actions, communications")
-        lines.append("      * Rewards")
-        lines.append("  - simulation.gif: Animated GIF of the entire simulation")
-        lines.append("")
-        
-        lines.append("METADATA:")
-        lines.append(f"  - Experiment: {self.metadata['experiment_name']}")
-        lines.append(f"  - Model: {self.metadata['model']}")
-        lines.append(f"  - Temperature: {self.metadata['temperature']}")
-        lines.append(f"  - Seed: {self.metadata['seed']}")
-        lines.append(f"  - Timestamp: {self.metadata['timestamp']}")
-        lines.append(f"  - Total Timesteps: {self.episode_lengths}")
-        lines.append("")
-        lines.append("=" * 80)
-        
-        return "\n".join(lines)
 
 
 # ============================================================================
@@ -1308,12 +1271,15 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     # Initialize communication manager
     comm_manager = CommunicationManager(num_agents=2)
     
+    # Initialize OpenAI client for embeddings
+    embedding_client = OpenAI()
+    
     # Initialize trajectory logger (will create experiment subfolder)
-    logger = TrajectoryLogger(save_dir, model, temperature, seed, num_agents=2)
+    logger = TrajectoryLogger(save_dir, model, temperature, seed, num_agents=2, embedding_client=embedding_client)
     
     # Update save_dir to point to the experiment subfolder for visualizations
     save_dir = logger.save_dir
-    visualizer = Visualizer(save_dir)
+    visualizer = Visualizer(logger.state_vis_dir)  # Save visualizations in subfolder
     
     # Reset environment
     key = jax.random.PRNGKey(seed)
@@ -1332,9 +1298,11 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     cumulative_other_eaten = np.array([0.0, 0.0])
     
     for t in range(num_steps):
+        timestep_start = time.time()
         print(f"Timestep {t}/{num_steps-1}", end="\r")
         
         # Generate observations for each agent
+        obs_start = time.time()
         observations = []
         for i, agent in enumerate(agents):
             obs_desc = agent.descriptor.describe_observation(
@@ -1344,6 +1312,8 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
                 state_np.grid
             )
             observations.append(obs_desc)
+        obs_time = time.time() - obs_start
+        logger.observation_times.append(obs_time)
         
         # Get messages for each agent
         agent_messages = [comm_manager.get_messages(i) for i in range(2)]
@@ -1372,37 +1342,16 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
         # Parse actions
         actions = [ActionParser.parse(a) for a in actions_str]
         
-        # Prepare agent data for logging
-        agents_data = []
-        for i in range(2):
-            agent_data = {
-                "agent_id": i,
-                "llm_input": raw_data_list[i]["llm_input"],
-                "llm_output": raw_data_list[i]["llm_output"],
-                "api_response": raw_data_list[i]["api_response"],
-                "observation": observations[i],
-                "belief": beliefs[i],
-                "action": actions_str[i],
-                "action_idx": actions[i],
-                "communication": communications[i],
-                "received_messages": agent_messages[i]
-            }
-            agents_data.append(agent_data)
-        
-        # Log timestep (before stepping environment, to log pre-action state)
-        logger.log_timestep(t, agents_data, obs_np, state_np, rewards,
-                           cumulative_own_eaten, cumulative_other_eaten)
-        
-        # Step environment
+        # Step environment FIRST (action at t leads to state at t+1)
         key, subkey = jax.random.split(key)
-        obs, state_np, rewards_new, done, info = env.step_env(
+        obs_new, state_new, rewards_new, done, info = env.step_env(
             subkey, state_np, jnp.array(actions)
         )
         
         # Convert to numpy
-        obs_np = np.array(obs)
-        state_np = jax.tree_util.tree_map(lambda x: np.array(x), state_np)
-        rewards = np.array(rewards_new)
+        obs_new_np = np.array(obs_new)
+        state_new_np = jax.tree_util.tree_map(lambda x: np.array(x), state_new)
+        rewards_new_np = np.array(rewards_new)
         
         # Update coin eating statistics
         # info["eat_own_coins"] contains coins of own color eaten in this step
@@ -1416,14 +1365,52 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
         for i in range(2):
             j = 1 - i  # Other agent
             # If agent i got positive reward and agent j got negative reward, i ate j's coin
-            if rewards[i] > 0 and rewards[j] < 0:
+            if rewards_new_np[i] > 0 and rewards_new_np[j] < 0:
                 cumulative_other_eaten[i] += 1
         
-        # Visualize
+        # Prepare agent data for logging (observation at t describes state at t, action at t leads to state at t+1)
+        agents_data = []
+        agent_colors = ["red", "green"]
+        for i in range(2):
+            agent_data = {
+                "agent_id": i,
+                "llm_input": raw_data_list[i]["llm_input"],
+                "llm_output": raw_data_list[i]["llm_output"],
+                "api_response": raw_data_list[i]["api_response"],
+                "observation": observations[i],  # Observation at t describing state at t
+                "belief": beliefs[i],
+                "action": actions_str[i],  # Action at t
+                "action_idx": actions[i],
+                "communication": communications[i],
+                "received_messages": agent_messages[i],
+                "token_usage": raw_data_list[i].get("token_usage", {}),
+                "api_time": raw_data_list[i].get("api_time", 0.0)
+            }
+            agents_data.append(agent_data)
+        
+        # Log timestep AFTER stepping (observation at t, action at t, state at t+1, rewards at t+1)
+        # Note: observation at t describes state at t, action at t leads to state at t+1
+        # Pass state_np (state at t) for semantic key construction, state_new_np (state at t+1) for logging
+        log_start = time.time()
+        logger.log_timestep(t, agents_data, obs_np, state_new_np, rewards_new_np,
+                           cumulative_own_eaten, cumulative_other_eaten, agent_colors, observation_state=state_np)
+        log_time = time.time() - log_start
+        logger.logging_times.append(log_time)
+        
+        # Visualize with new state
         visualizer.render_timestep(
-            t, env, state_np, observations, communications,
-            actions_str, beliefs, rewards
+            t, env, state_new_np, observations, communications,
+            actions_str, beliefs, rewards_new_np
         )
+        
+        # Update state for next iteration
+        obs_np = obs_new_np
+        state_np = state_new_np
+        rewards = rewards_new_np
+        
+        # Track total timestep time
+        timestep_time = time.time() - timestep_start
+        logger.timestep_times.append(timestep_time)
         
         # Check if done
         if done["__all__"]:
@@ -1438,8 +1425,14 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     # Save trajectory logs
     logger.save()
     
-    # Create GIF
+    # Create GIF in main save_dir
     visualizer.create_gif()
+    # Move GIF to main save_dir
+    import shutil
+    gif_src = os.path.join(logger.state_vis_dir, "simulation.gif")
+    gif_dst = os.path.join(logger.save_dir, "simulation.gif")
+    if os.path.exists(gif_src):
+        shutil.move(gif_src, gif_dst)
     
     print(f"\nResults saved to: {save_dir}")
 
@@ -1452,16 +1445,18 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Run LLM agent simulation for Coins game")
-    parser.add_argument("--steps", type=int, default=20, 
-                       help="Number of timesteps to simulate (default: 20)")
+    parser.add_argument("--steps", type=int, default=1000, 
+                       help="Number of timesteps to simulate (default: 1000)")
     parser.add_argument("--output-dir", type=str, default="./llm_simulation_output",
                        help="Directory to save visualizations (default: ./llm_simulation_output)")
-    parser.add_argument("--model", type=str, default="gpt-5-mini",
-                       help="Model name to use (default: gpt-5-mini)")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                       help="Sampling temperature 0.0-2.0 (default: 0.7)")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed for environment (default: 42)")
+    parser.add_argument("--model", type=str, default="o3",
+                       help="Model name to use (default: o3)")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                       help="Sampling temperature 0.0-2.0 (default: 0.0)")
+    parser.add_argument("--seed", type=int, default=None,
+                       help="Random seed for environment (default: None, will run 10 seeds)")
+    parser.add_argument("--num-runs", type=int, default=10,
+                       help="Number of runs with different seeds (default: 10)")
     
     args = parser.parse_args()
     
@@ -1470,16 +1465,33 @@ if __name__ == "__main__":
     print("=" * 70)
     print(f"Model: {args.model}")
     print(f"Temperature: {args.temperature}")
-    print(f"Steps: {args.steps}")
-    print(f"Seed: {args.seed}")
+    print(f"Steps per run: {args.steps}")
+    print(f"Number of runs: {args.num_runs}")
     print(f"Output: {args.output_dir}")
     print("=" * 70)
     
-    run_simulation(
-        num_steps=args.steps,
-        save_dir=args.output_dir,
-        model=args.model,
-        temperature=args.temperature,
-        seed=args.seed
-    )
+    # Run multiple times with different seeds
+    if args.seed is not None:
+        # Single run with specified seed
+        run_simulation(
+            num_steps=args.steps,
+            save_dir=args.output_dir,
+            model=args.model,
+            temperature=args.temperature,
+            seed=args.seed
+        )
+    else:
+        # Multiple runs with different seeds
+        seeds = list(range(42, 42 + args.num_runs))
+        for i, seed in enumerate(seeds):
+            print(f"\n{'='*70}")
+            print(f"Run {i+1}/{args.num_runs} with seed {seed}")
+            print(f"{'='*70}")
+            run_simulation(
+                num_steps=args.steps,
+                save_dir=args.output_dir,
+                model=args.model,
+                temperature=args.temperature,
+                seed=seed
+            )
 

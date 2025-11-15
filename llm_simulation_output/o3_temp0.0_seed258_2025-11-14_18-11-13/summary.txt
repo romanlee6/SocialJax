@@ -1,0 +1,70 @@
+================================================================================
+SIMULATION SUMMARY
+================================================================================
+
+EXPERIMENT METADATA:
+  Model: o3
+  Temperature: 0.0
+  Seed: 258
+  Timestamp: 2025-11-14_18-11-13
+  Total Timesteps: 100
+
+================================================================================
+TOKEN USAGE AND TIME
+================================================================================
+  Total Prompt Tokens: 0
+  Total Completion Tokens: 0
+  Total Tokens: 292723
+  Total API Time: 4524.63 seconds
+  Average Time per Timestep: 45.246 seconds
+
+================================================================================
+PERFORMANCE PROFILING
+================================================================================
+  Average Timestep Time: 45.586 seconds
+  Average API Call Time: 22.623 seconds
+  Total API Calls: 200
+  API Time Percentage: 99.3%
+  Average Observation Generation Time: 0.000 seconds
+  Average Logging Time: 0.070 seconds
+
+================================================================================
+AGENT PERFORMANCE
+================================================================================
+
+Agent 0:
+  Total Reward: 18.00
+  Average Return per Timestep: 0.1800
+  Number of Communications Sent: 99
+  Total Own-Color Coins Eaten: 18
+  Total Other-Color Coins Eaten: 0
+  Action Distribution:
+    up: 26 times (26.0%)
+    down: 25 times (25.0%)
+    right: 24 times (24.0%)
+    left: 18 times (18.0%)
+    turn_left: 6 times (6.0%)
+    turn_right: 1 times (1.0%)
+
+Agent 1:
+  Total Reward: 16.00
+  Average Return per Timestep: 0.1600
+  Number of Communications Sent: 99
+  Total Own-Color Coins Eaten: 16
+  Total Other-Color Coins Eaten: 0
+  Action Distribution:
+    up: 27 times (27.0%)
+    left: 26 times (26.0%)
+    right: 23 times (23.0%)
+    down: 13 times (13.0%)
+    turn_right: 5 times (5.0%)
+    turn_left: 5 times (5.0%)
+    stay: 1 times (1.0%)
+
+================================================================================
+ENVIRONMENT METRICS
+================================================================================
+  Average Red Coins in Environment: 2.89
+  Average Green Coins in Environment: 1.66
+
+================================================================================

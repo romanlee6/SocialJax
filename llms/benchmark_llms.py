@@ -166,19 +166,19 @@ class BenchmarkLogger:
 class BenchmarkRunner:
     """Runs benchmark simulations across multiple models."""
     
-    def __init__(self, models: List[str], num_steps: int, seed: int, 
+    def __init__(self, model_configs: List[Dict], num_steps: int, seed: int, 
                  base_output_dir: str, temperature: float = 0.7):
         """
         Initialize benchmark runner.
         
         Args:
-            models: List of model names to benchmark
+            model_configs: List of model config dicts, each with 'model' (str) and optionally 'reasoning' (str)
             num_steps: Number of simulation steps for each model
             seed: Environment seed (fixed for fair comparison)
             base_output_dir: Base directory for all outputs
             temperature: Sampling temperature for LLMs
         """
-        self.models = models
+        self.model_configs = model_configs
         self.num_steps = num_steps
         self.seed = seed
         self.temperature = temperature
@@ -186,33 +186,44 @@ class BenchmarkRunner:
         
         self.logger = BenchmarkLogger(base_output_dir)
     
-    def run_single_model(self, model_name: str) -> Dict:
+    def run_single_model(self, model_config: Dict) -> Dict:
         """
         Run simulation for a single model and collect metrics.
         
         Args:
-            model_name: Name of the model to test
+            model_config: Dict with 'model' (str) and optionally 'reasoning' (str)
             
         Returns:
             Dictionary with performance metrics, timing, and token usage
         """
+        model_name = model_config['model']
+        reasoning = model_config.get('reasoning')
+        
+        # Create display name for logging
+        # "none" or None means default behavior (no reasoning parameter)
+        if reasoning and reasoning != "none":
+            display_name = f"{model_name}_reasoning-{reasoning}"
+        else:
+            display_name = model_name
+        
         print(f"\n{'='*80}")
-        print(f"Running benchmark for model: {model_name}")
+        print(f"Running benchmark for model: {display_name}")
         print(f"{'='*80}")
         
         result = {
-            "model": model_name,
+            "model": display_name,
             "status": "running",
             "seed": self.seed,
             "num_steps": self.num_steps,
-            "temperature": self.temperature
+            "temperature": self.temperature,
+            "reasoning": reasoning
         }
         
         try:
             # Create model-specific output directory
             model_output_dir = os.path.join(
                 self.logger.benchmark_dir, 
-                f"{model_name.replace('/', '_')}_seed{self.seed}"
+                f"{display_name.replace('/', '_')}_seed{self.seed}"
             )
             os.makedirs(model_output_dir, exist_ok=True)
             
@@ -229,9 +240,9 @@ class BenchmarkRunner:
             # Initialize agents
             agents = [
                 LLMAgent(agent_id=0, team_color="red", model=model_name, 
-                        temperature=self.temperature),
+                        temperature=self.temperature, reasoning=reasoning),
                 LLMAgent(agent_id=1, team_color="green", model=model_name,
-                        temperature=self.temperature)
+                        temperature=self.temperature, reasoning=reasoning)
             ]
             
             # Initialize communication manager
@@ -257,7 +268,7 @@ class BenchmarkRunner:
             
             # Trajectory storage for detailed logging
             trajectory_log = {
-                "model": model_name,
+                "model": display_name,
                 "seed": self.seed,
                 "temperature": self.temperature,
                 "timesteps": []
@@ -410,7 +421,7 @@ class BenchmarkRunner:
             print(f"  Model output saved to: {model_output_dir}")
             
         except Exception as e:
-            print(f"\n  ERROR: Benchmark failed for {model_name}: {e}")
+            print(f"\n  ERROR: Benchmark failed for {display_name}: {e}")
             import traceback
             traceback.print_exc()
             result.update({
@@ -425,15 +436,17 @@ class BenchmarkRunner:
         print(f"\n{'='*80}")
         print("STARTING LLM BENCHMARK")
         print(f"{'='*80}")
-        print(f"Models to test: {', '.join(self.models)}")
+        model_names = [f"{cfg['model']}" + (f"_reasoning-{cfg.get('reasoning')}" if cfg.get('reasoning') and cfg.get('reasoning') != "none" else "") 
+                      for cfg in self.model_configs]
+        print(f"Models to test: {', '.join(model_names)}")
         print(f"Number of steps: {self.num_steps}")
         print(f"Environment seed: {self.seed}")
         print(f"Temperature: {self.temperature}")
         print(f"{'='*80}\n")
         
-        for model_name in self.models:
-            result = self.run_single_model(model_name)
-            self.logger.add_model_result(model_name, result)
+        for model_config in self.model_configs:
+            result = self.run_single_model(model_config)
+            self.logger.add_model_result(result['model'], result)
         
         # Save summary
         self.logger.save_summary()
@@ -487,8 +500,8 @@ Example usage:
         "--models", 
         type=str, 
         nargs="+",
-        default=["gpt-5", "gpt-5-mini", "o3", "o4-mini", "gpt-oss-120b"],
-        help="List of models to benchmark (default: gpt-5 gpt-5-mini o3 o4-mini gpt-oss-120b)"
+        default=None,
+        help="List of models to benchmark (if not specified, uses default set: gpt-5.1 with reasoning levels, gpt-5-mini, gpt-5-nano, o3)"
     )
     parser.add_argument(
         "--steps", 
@@ -523,9 +536,38 @@ Example usage:
         print("Please set it before running the benchmark.")
         sys.exit(1)
     
+    # Build model configurations
+    if args.models is None:
+        # Default: GPT-5.1 with default (none) and different reasoning levels, plus comparison models
+        # Note: "none" means no reasoning parameter is passed (default behavior)
+        model_configs = [
+            {"model": "gpt-5.1"},  # Default: no reasoning parameter (effort="none" by default)
+            {"model": "gpt-5.1", "reasoning": "low"},
+            {"model": "gpt-5.1", "reasoning": "medium"},
+            {"model": "gpt-5.1", "reasoning": "high"},
+            {"model": "gpt-5-mini"},
+            {"model": "gpt-5-nano"},
+            {"model": "o3"},
+        ]
+    else:
+        # Parse simple model names (backward compatibility)
+        model_configs = [{"model": m} for m in args.models]
+    
+    # Check if GPT-5.1 is being used and verify environment variables
+    has_gpt51 = any(cfg.get("model") == "gpt-5.1" for cfg in model_configs)
+    if has_gpt51:
+        gpt51_url = os.getenv("GPT_51_URL")
+        gpt51_key = os.getenv("GPT_51_KEY")
+        if not gpt51_url or not gpt51_key:
+            print("ERROR: GPT-5.1 model requires GPT_51_URL and GPT_51_KEY environment variables.")
+            print(f"  GPT_51_URL: {'set' if gpt51_url else 'NOT SET'}")
+            print(f"  GPT_51_KEY: {'set' if gpt51_key else 'NOT SET'}")
+            print("Please set both environment variables before running the benchmark.")
+            sys.exit(1)
+    
     # Create and run benchmark
     runner = BenchmarkRunner(
-        models=args.models,
+        model_configs=model_configs,
         num_steps=args.steps,
         seed=args.seed,
         base_output_dir=args.output_dir,
