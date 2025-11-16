@@ -39,12 +39,9 @@ import jax.numpy as jnp
 import wandb
 import copy
 from omegaconf import OmegaConf
-import hydra
 from pathlib import Path
 
 # Import configs
-from hydra import compose, initialize
-from hydra.core.global_hydra import GlobalHydraInstance
 import importlib.util
 
 def import_module_from_path(module_name, file_path):
@@ -75,11 +72,7 @@ make_train_infopg = infopg_module.make_train
 make_train_autoencoder = autoencoder_module.make_train_comm
 
 def load_config(algorithm_name):
-    """Load default config for each algorithm"""
-    # Clear any existing hydra instance
-    if GlobalHydraInstance().instance is not None:
-        GlobalHydraInstance().instance.clear()
-    
+    """Load default config for each algorithm by reading YAML directly"""
     config_name_map = {
         "lgtom": "lgtom_cnn_coins",
         "infopg": "infopg_cnn_coins",
@@ -93,10 +86,12 @@ def load_config(algorithm_name):
         "autoencoder": "AutoEncoder"
     }
     
-    config_path = f"algorithms/{algorithm_dir_map[algorithm_name]}/config"
-    with initialize(config_path=config_path, version_base=None):
-        cfg = compose(config_name=config_name_map[algorithm_name])
-        return OmegaConf.to_container(cfg, resolve=True)
+    # Load YAML file directly using OmegaConf (handles quoted keys)
+    base_path = Path(__file__).parent
+    config_file = base_path / "algorithms" / algorithm_dir_map[algorithm_name] / "config" / f"{config_name_map[algorithm_name]}.yaml"
+    
+    cfg = OmegaConf.load(config_file)
+    return OmegaConf.to_container(cfg, resolve=True)
 
 def create_base_config():
     """Create base configuration with common settings"""
