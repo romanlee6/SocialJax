@@ -49,15 +49,15 @@ class ObservationDescriptor:
     ACTION_NAMES = {
         0: "turn_left",
         1: "turn_right", 
-        2: "step_left",
-        3: "step_right",
-        4: "forward",
-        5: "backward",
+        2: "left",
+        3: "right",
+        4: "up",
+        5: "down",
         6: "stay",
         7: "mine"
     }
     
-    # Coordinate system: (0,0) is at top-left, x increases south, y increases east
+    # Coordinate system: (0,0) is at top-left, row increases down, col increases right
     # direction 0=North, 1=East, 2=South, 3=West
     DIRECTION_NAMES = ["North", "East", "South", "West"]
     
@@ -85,9 +85,8 @@ class ObservationDescriptor:
         
         # Agent's position and orientation
         agent_row, agent_col, direction = int(agent_loc[0]), int(agent_loc[1]), int(agent_loc[2])
-        dir_name = self.DIRECTION_NAMES[direction]
         desc_parts.append(f"You are Agent {self.agent_id}.")
-        desc_parts.append(f"Your position: row {agent_row}, col {agent_col}, facing {dir_name}.")
+        desc_parts.append(f"Your position: row {agent_row}, col {agent_col}.")
         
         # The observation FOV is asymmetric and depends on orientation
         # FOV: forward=9, backward=1, left=5, right=5 (11x11 total)
@@ -153,9 +152,8 @@ class ObservationDescriptor:
         gold_ores = []
         gold_partials = []
         other_agents = []
-        walls_by_direction = {"north": 0, "south": 0, "east": 0, "west": 0}
         
-        # Scan grid for ores and walls
+        # Scan grid for ores
         for row in range(grid.shape[0]):
             for col in range(grid.shape[1]):
                 in_fov, rel_row, rel_col = is_in_fov(row, col)
@@ -171,16 +169,6 @@ class ObservationDescriptor:
                     gold_ores.append((row, col, rel_row, rel_col))
                 elif cell == Items.gold_partial:
                     gold_partials.append((row, col, rel_row, rel_col))
-                elif cell == Items.wall:
-                    # Categorize wall by direction
-                    if rel_row < 0:
-                        walls_by_direction["north"] += 1
-                    elif rel_row > 0:
-                        walls_by_direction["south"] += 1
-                    if rel_col < 0:
-                        walls_by_direction["west"] += 1
-                    elif rel_col > 0:
-                        walls_by_direction["east"] += 1
         
         # Check for other agents in FOV
         for i, other_loc in enumerate(all_agent_locs):
@@ -228,15 +216,6 @@ class ObservationDescriptor:
                 direction_desc = self._relative_position_desc(rel_row, rel_col)
                 desc_parts.append(f"  - Agent at position (row {obj_row}, col {obj_col}) - {direction_desc}")
         
-        # Describe walls by direction
-        wall_directions = [d for d, count in walls_by_direction.items() if count > 0]
-        if wall_directions:
-            desc_parts.append(f"\nWalls detected:")
-            for direction in ["north", "south", "east", "west"]:
-                count = walls_by_direction[direction]
-                if count > 0:
-                    desc_parts.append(f"  - {count} wall segment(s) to the {direction}")
-        
         # Append messages to observation if provided
         if received_messages:
             desc_parts.append("\n=== Messages from Other Agents ===")
@@ -250,11 +229,11 @@ class ObservationDescriptor:
     
     def _relative_position_desc(self, rel_row: int, rel_col: int) -> str:
         """
-        Generate description of relative position.
+        Generate description of relative position using up/down/left/right.
         
         Coordinate system: (0,0) is top-left corner
-        - row-axis: north (0) to south (increasing)
-        - col-axis: west (0) to east (increasing)
+        - row-axis: up (0) to down (increasing)
+        - col-axis: left (0) to right (increasing)
         """
         if rel_row == 0 and rel_col == 0:
             return "at your location"
@@ -262,19 +241,19 @@ class ObservationDescriptor:
         vertical = ""
         horizontal = ""
         
-        # rel_row < 0 means object has smaller row = more north
-        # rel_row > 0 means object has larger row = more south
+        # rel_row < 0 means object has smaller row = more up
+        # rel_row > 0 means object has larger row = more down
         if rel_row < 0:
-            vertical = f"{abs(rel_row)} step(s) north"
+            vertical = f"{abs(rel_row)} step(s) up"
         elif rel_row > 0:
-            vertical = f"{rel_row} step(s) south"
+            vertical = f"{rel_row} step(s) down"
             
-        # rel_col < 0 means object has smaller col = more west
-        # rel_col > 0 means object has larger col = more east
+        # rel_col < 0 means object has smaller col = more left
+        # rel_col > 0 means object has larger col = more right
         if rel_col < 0:
-            horizontal = f"{abs(rel_col)} step(s) west"
+            horizontal = f"{abs(rel_col)} step(s) left"
         elif rel_col > 0:
-            horizontal = f"{rel_col} step(s) east"
+            horizontal = f"{rel_col} step(s) right"
             
         if vertical and horizontal:
             return f"{vertical} and {horizontal}"
@@ -625,24 +604,16 @@ MAP AND COORDINATE SYSTEM:
 - Map size: 27 rows × 27 columns grid
 - Coordinate system: (row, col) where:
   * Origin (0, 0) is at the TOP-LEFT corner
-  * Row-axis: increases from North (0) to South (27)
-  * Col-axis: increases from West (0) to East (27)
+  * Row-axis: increases from top (0) to bottom (27) - "up" means decreasing row, "down" means increasing row
+  * Col-axis: increases from left (0) to right (27) - "left" means decreasing col, "right" means increasing col
 - Your position is given as (row, col) coordinates
 
-DIRECTIONS AND ORIENTATION:
-- You have a facing direction: North, East, South, or West
-- Direction meanings:
-  * North: facing towards lower row values (decreasing row)
-  * South: facing towards higher row values (increasing row)
-  * East: facing towards higher col values (increasing col)
-  * West: facing towards lower col values (decreasing col)
-
 FIELD OF VIEW (FOV):
-- Your vision is asymmetric based on your facing direction:
-  * Forward: 9 steps in the direction you're facing
-  * Backward: 1 step behind you
+- Your vision is asymmetric:
+  * Forward: 9 steps ahead
+  * Backward: 1 step behind
   * Left/Right: 5 steps on each side
-- Objects are described with their absolute (row, col) positions and relative directions
+- Objects are described with their absolute (row, col) positions and relative directions using up/down/left/right
 
 REWARD STRUCTURE:
 - Mining iron ore: +1 point (reliable, no coordination needed)
@@ -664,16 +635,16 @@ COMMUNICATION:
 AVAILABLE ACTIONS:
 - turn_left: Rotate 90 degrees counterclockwise
 - turn_right: Rotate 90 degrees clockwise
-- step_left: Move west (strafe left)
-- step_right: Move east (strafe right)
-- forward: Move in the direction you're facing
-- backward: Move opposite to the direction you're facing
+- up: Move up (decrease row value)
+- down: Move down (increase row value)
+- left: Move left (decrease col value)
+- right: Move right (increase col value)
 - stay: Stay in place
 - mine: Activate mining beam to extract ore in front of you (up to 3 tiles ahead)
 
 OUTPUT FORMAT (must follow exactly):
 BELIEF: [One sentence describing your current understanding of the situation including current position, next goal, and general game strategy.]
-ACTION: [One of: turn_left, turn_right, step_left, step_right, forward, backward, stay, mine]
+ACTION: [One of: turn_left, turn_right, up, down, left, right, stay, mine]
 COMMUNICATION: [Your message to other agents, or "[No message]"]
 """
 
@@ -721,8 +692,9 @@ COMMUNICATION: [Your message to other agents, or "[No message]"]
         action_match = re.search(r'ACTION:\s*(\w+)', output, re.IGNORECASE)
         if action_match:
             action_candidate = action_match.group(1).strip().lower()
-            # Validate action
-            valid_actions = ['turn_left', 'turn_right', 'step_left', 'step_right', 'forward', 'backward', 'stay', 'mine']
+            # Validate action (accept both absolute and relative for backward compatibility)
+            valid_actions = ['turn_left', 'turn_right', 'up', 'down', 'left', 'right', 'stay', 'mine',
+                           'step_left', 'step_right', 'forward', 'backward']  # Legacy support
             if action_candidate in valid_actions:
                 action = action_candidate
                 
@@ -741,7 +713,21 @@ COMMUNICATION: [Your message to other agents, or "[No message]"]
 class ActionParser:
     """Converts LLM action strings to environment action indices."""
     
-    ACTION_MAP = {
+    # Map absolute directions to environment actions
+    # The environment uses relative actions, so we need agent direction to convert
+    ABSOLUTE_ACTION_MAP = {
+        'up': 4,      # forward when facing north, maps to forward
+        'down': 5,    # backward when facing north, maps to backward  
+        'left': 2,    # step_left
+        'right': 3,   # step_right
+        'turn_left': 0,
+        'turn_right': 1,
+        'stay': 6,
+        'mine': 7
+    }
+    
+    # Legacy relative actions for backward compatibility
+    RELATIVE_ACTION_MAP = {
         'turn_left': 0,
         'turn_right': 1,
         'step_left': 2,
@@ -753,15 +739,78 @@ class ActionParser:
     }
     
     @staticmethod
-    def parse(action_str: str) -> int:
-        """Convert action string to action index."""
+    def parse(action_str: str, agent_direction: int = None) -> int:
+        """
+        Convert action string to action index.
+        
+        For absolute directions (up, down, left, right), we need to convert
+        to relative actions based on agent's current direction.
+        """
         action_str = action_str.lower().strip()
-        return ActionParser.ACTION_MAP.get(action_str, 6)  # Default to 'stay'
+        
+        # Try absolute direction first
+        if action_str in ActionParser.ABSOLUTE_ACTION_MAP:
+            abs_action = action_str
+            if abs_action in ['up', 'down', 'left', 'right'] and agent_direction is not None:
+                # Convert absolute direction to relative action based on agent's facing direction
+                # direction: 0=North, 1=East, 2=South, 3=West
+                # Up = decreasing row (north), Down = increasing row (south)
+                # Left = decreasing col (west), Right = increasing col (east)
+                if abs_action == 'up':
+                    # Up means decreasing row (north)
+                    if agent_direction == 0:  # Facing north
+                        return 4  # forward (north = up)
+                    elif agent_direction == 1:  # Facing east
+                        return 2  # step_left (north = up)
+                    elif agent_direction == 2:  # Facing south
+                        return 5  # backward (north = up)
+                    else:  # Facing west (3)
+                        return 3  # step_right (north = up)
+                elif abs_action == 'down':
+                    # Down means increasing row (south)
+                    if agent_direction == 0:  # Facing north
+                        return 5  # backward (south = down)
+                    elif agent_direction == 1:  # Facing east
+                        return 3  # step_right (south = down)
+                    elif agent_direction == 2:  # Facing south
+                        return 4  # forward (south = down)
+                    else:  # Facing west (3)
+                        return 2  # step_left (south = down)
+                elif abs_action == 'left':
+                    # Left means decreasing col (west)
+                    if agent_direction == 0:  # Facing north
+                        return 2  # step_left (west = left)
+                    elif agent_direction == 1:  # Facing east
+                        return 5  # backward (west = left)
+                    elif agent_direction == 2:  # Facing south
+                        return 3  # step_right (west = left)
+                    else:  # Facing west (3)
+                        return 4  # forward (west = left)
+                elif abs_action == 'right':
+                    # Right means increasing col (east)
+                    if agent_direction == 0:  # Facing north
+                        return 3  # step_right (east = right)
+                    elif agent_direction == 1:  # Facing east
+                        return 4  # forward (east = right)
+                    elif agent_direction == 2:  # Facing south
+                        return 2  # step_left (east = right)
+                    else:  # Facing west (3)
+                        return 5  # backward (east = right)
+            else:
+                # turn_left, turn_right, stay, mine don't need conversion
+                return ActionParser.ABSOLUTE_ACTION_MAP[abs_action]
+        
+        # Fall back to relative actions for backward compatibility
+        if action_str in ActionParser.RELATIVE_ACTION_MAP:
+            return ActionParser.RELATIVE_ACTION_MAP[action_str]
+        
+        # Default to 'stay'
+        return 6
     
     @staticmethod
     def action_to_string(action_idx: int) -> str:
         """Convert action index to string."""
-        for name, idx in ActionParser.ACTION_MAP.items():
+        for name, idx in ActionParser.ABSOLUTE_ACTION_MAP.items():
             if idx == action_idx:
                 return name
         return "stay"
@@ -1180,31 +1229,34 @@ class Visualizer:
     def render_timestep(self, timestep: int, env: CoopMining, state,
                        observations: List[str], communications: List[str],
                        actions: List[str], beliefs: List[str],
-                       rewards: np.ndarray):
-        """Render a single timestep to PNG."""
+                       rewards: np.ndarray, plain_observations: List[str] = None):
+        """
+        Render a single timestep to PNG with all agents (up to 6).
         
-        # Create figure with grid layout
-        fig = plt.figure(figsize=(20, 12))
-        gs = GridSpec(3, 2, figure=fig, hspace=0.3, wspace=0.3)
+        Args:
+            plain_observations: Observations without communication messages
+        """
+        num_agents = len(observations)
         
-        # Main game state (top, spanning both columns)
-        # Convert state to numpy first to materialize all values, then back to JAX
-        # This ensures all traced values become concrete before rendering
+        # Create figure with grid layout - adjust size based on number of agents
+        # Layout: game state on top, then agents in rows of 3
+        rows = 1 + ((num_agents + 2) // 3)  # +1 for game state, +2 to round up
+        fig = plt.figure(figsize=(24, 4 + rows * 3))
+        gs = GridSpec(rows, 3, figure=fig, hspace=0.4, wspace=0.3)
+        
+        # Main game state (top, spanning all columns)
         def materialize(x):
             """Convert JAX array to numpy, ensuring it's concrete."""
             if hasattr(x, '__array__'):
-                # Block until ready if it's a JAX array
                 if hasattr(x, 'block_until_ready'):
                     x = x.block_until_ready()
                 return np.array(x)
             return x
         
         state_np_materialized = jax.tree_util.tree_map(materialize, state)
-        # Convert back to JAX for rendering (but now all values are concrete)
         state_concrete = jax.tree_util.tree_map(lambda x: jnp.array(x) if isinstance(x, (np.ndarray, int, float)) else x, state_np_materialized)
         
         game_img = env.render(state_concrete)
-        # Convert JAX array to numpy for matplotlib and block until ready
         game_img = jax.block_until_ready(game_img)
         game_img_np = np.array(game_img)
         ax_game = fig.add_subplot(gs[0, :])
@@ -1213,15 +1265,19 @@ class Visualizer:
                          fontsize=16, fontweight='bold')
         ax_game.axis('off')
         
-        # Agent 0 info (left column)
-        ax_agent0 = fig.add_subplot(gs[1:, 0])
-        self._render_agent_info(ax_agent0, 0, observations[0], beliefs[0],
-                               actions[0], communications[0], rewards[0])
-        
-        # Agent 1 info (right column)
-        ax_agent1 = fig.add_subplot(gs[1:, 1])
-        self._render_agent_info(ax_agent1, 1, observations[1], beliefs[1],
-                               actions[1], communications[1], rewards[1])
+        # Render all agents (up to 6)
+        for i in range(min(num_agents, 6)):
+            row = 1 + (i // 3)
+            col = i % 3
+            ax_agent = fig.add_subplot(gs[row, col])
+            
+            # Use plain observation if available, otherwise use full observation
+            obs_to_show = plain_observations[i] if plain_observations and i < len(plain_observations) else observations[i]
+            
+            self._render_agent_info(ax_agent, i, obs_to_show, beliefs[i] if i < len(beliefs) else "",
+                                   actions[i] if i < len(actions) else "stay", 
+                                   communications[i] if i < len(communications) else "[No message]",
+                                   rewards[i] if i < len(rewards) else 0.0)
         
         # Save figure
         plt.savefig(f"{self.save_dir}/timestep_{timestep:04d}.png", 
@@ -1393,7 +1449,19 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
         # Generate observations for each agent (with messages appended)
         obs_start = time.time()
         observations = []
+        plain_observations = []  # Observations without communication
         for i, agent in enumerate(agents):
+            # Plain observation without messages
+            plain_obs = agent.descriptor.describe_observation(
+                obs_np[i], 
+                state_np.agent_locs[i],
+                state_np.agent_locs,
+                state_np.grid,
+                received_messages=None  # No messages
+            )
+            plain_observations.append(plain_obs)
+            
+            # Full observation with messages
             obs_desc = agent.descriptor.describe_observation(
                 obs_np[i], 
                 state_np.agent_locs[i],
@@ -1424,8 +1492,11 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
             beliefs.append(agent.belief_state)
             raw_data_list.append(raw_data)
         
-        # Parse actions
-        actions = [ActionParser.parse(a) for a in actions_str]
+        # Parse actions (need agent direction for absolute direction conversion)
+        actions = []
+        for i, action_str in enumerate(actions_str):
+            agent_direction = int(state_np.agent_locs[i][2])
+            actions.append(ActionParser.parse(action_str, agent_direction=agent_direction))
         
         # Now step environment with all collected actions
         # Convert state back to JAX for stepping (JIT functions need JAX arrays)
@@ -1499,7 +1570,7 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
                 state_for_render = jax.tree_util.tree_map(lambda x: jnp.array(x), state_new_np)
                 visualizer.render_timestep(
                     t, env, state_for_render, observations, communications,
-                    actions_str, beliefs, rewards_new_np
+                    actions_str, beliefs, rewards_new_np, plain_observations=plain_observations
                 )
                 # Clear the render state to free memory
                 del state_for_render

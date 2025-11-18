@@ -1382,8 +1382,10 @@ def make_train_comm(config):
                 train_mode=True
             )
         else:
+            # Split RNG for each agent to ensure reproducibility
+            init_rngs = jax.random.split(_rng, env.num_agents)
             network_params = [network[i].init(
-                {'params': _rng, 'gumbel': _rng},
+                {'params': init_rngs[i], 'gumbel': init_rngs[i]},
                 init_obs,
                 init_comm,
                 init_hidden,
@@ -2277,8 +2279,10 @@ def make_train_comm(config):
             else:
                 update_state_dict = []
                 metric = []
+                # Split RNG for each agent to ensure reproducibility
+                agent_rngs = jax.random.split(rng, env.num_agents)
                 for i in range(env.num_agents):
-                    update_state = (train_state[i], traj_batch[i], action_advantages[i], comm_advantages[i], targets[i], rng)
+                    update_state = (train_state[i], traj_batch[i], action_advantages[i], comm_advantages[i], targets[i], agent_rngs[i])
                     update_state, loss_info = jax.lax.scan(
                         lambda state, unused: _update_epoch(state, unused, i), update_state, None, config["UPDATE_EPOCHS"]
                     )
@@ -2292,7 +2296,8 @@ def make_train_comm(config):
                     else:
                         metric_i['loss'] = loss_info[0].mean() if isinstance(loss_info, tuple) else loss_info.mean()
                     metric.append(metric_i)
-                    rng = update_state[-1]
+                # Combine RNGs from all agents deterministically
+                rng = update_state_dict[-1][-1]  # Use the last agent's RNG as the final RNG
             
             def callback(metric):
                 # Convert all JAX arrays to Python scalars for wandb
@@ -2439,7 +2444,9 @@ def make_train(config):
         if config["PARAMETER_SHARING"]:
             network_params = network.init(_rng, init_x)
         else:
-            network_params = [network[i].init(_rng, init_x) for i in range(env.num_agents)]
+            # Split RNG for each agent to ensure reproducibility
+            init_rngs = jax.random.split(_rng, env.num_agents)
+            network_params = [network[i].init(init_rngs[i], init_x) for i in range(env.num_agents)]
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -2703,8 +2710,10 @@ def make_train(config):
             else:
                 update_state_dict = []
                 metric = []
+                # Split RNG for each agent to ensure reproducibility
+                agent_rngs = jax.random.split(rng, env.num_agents)
                 for i in range(env.num_agents):
-                    update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], rng)
+                    update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], agent_rngs[i])
                     update_state, loss_info = jax.lax.scan(
                         lambda state, unused: _update_epoch(state, unused, i), update_state, None, config["UPDATE_EPOCHS"]
                     )
@@ -2713,7 +2722,8 @@ def make_train(config):
                     metric_i = traj_batch[i].info
                     metric_i['loss'] = loss_info[0]
                     metric.append(metric_i)
-                    rng = update_state[-1]
+                # Combine RNGs from all agents deterministically
+                rng = update_state_dict[-1][-1]  # Use the last agent's RNG as the final RNG
                 
             def callback(metric):
                 # Convert all JAX arrays to Python scalars for wandb
@@ -3072,33 +3082,32 @@ def evaluate(params, env, save_path, config):
 
 def tune(default_config):
     """
-    Hyperparameter sweep with wandb for LLM supervision experiments.
+    Hyperparameter sweep with wandb for coefficient ablation study.
     
-    Sweeps over two configurations:
-    1. ToM supervised on LLM beliefs + Intrinsic reward
-       - USE_TOM: True (required for belief supervision)
-       - SUPERVISED_BELIEF: "llm"
-       - SUPERVISED_COMM: "none"
-       - USE_INTRINSIC_REWARD: True
-       - SOCIAL_INFLUENCE_COEFF: 0.1
-    2. Communication supervised on LLM communication + No Intrinsic reward
-       - USE_TOM: False (required for communication supervision)
-       - SUPERVISED_COMM: "llm"
-       - SUPERVISED_BELIEF: "none"
-       - USE_INTRINSIC_REWARD: False
-       - SOCIAL_INFLUENCE_COEFF: 0.0
+    Sweeps over three hyperparameters:
+    - COMM_LOSS_COEF: [0.1, 1.0] - Communication loss coefficient
+    - SOCIAL_INFLUENCE_COEFF: [0.1, 1.0] - Intrinsic reward coefficient
+    - SUPERVISED_LOSS_COEF: [0.1, 1.0] - Supervised learning loss coefficient
     
-    Note: Supervised communication requires USE_TOM = False because each agent
-    aligns their own communication vector with LLM ground truth independently.
+    Fixed parameters:
+    - USE_COMM: True
+    - PARAMETER_SHARING: False (non-parameter-sharing)
+    - USE_SEPARATE_REWARDS: False (joint_reward)
+    - INFLUENCE_TARGET: "belief"
+    - SEED: 110
+    - ENV_KWARGS.shared_rewards: False
+    - USE_TOM: True
+    - SUPERVISED_BELIEF: "llm"
+    - USE_INTRINSIC_REWARD: True
     
-    Total runs: 2 configurations
+    Total runs: 2 × 2 × 2 = 8 configurations
     """
     import copy
 
     default_config = OmegaConf.to_container(default_config)
 
     sweep_config = {
-        "name": "lgtom_llm_supervision_sweep",
+        "name": "lgtom_coefficient_sweep",
         "method": "grid",  # Try all combinations
         "program": "lgtom_cnn_coins.py",  # The script to run
         "metric": {
@@ -3106,21 +3115,21 @@ def tune(default_config):
             "goal": "maximize",
         },
         "parameters": {
-            # Configuration selector: "tom_llm_intrinsic" or "comm_llm_no_intrinsic"
-            "CONFIG_TYPE": {
-                "values": ["tom_llm_intrinsic", "comm_llm_no_intrinsic"]
-            },
+            # Sweep parameters: 2 × 2 × 2 = 8 combinations
+            "COMM_LOSS_COEF": {"values": [0.1, 1.0]},  # Communication loss coefficient
+            "SOCIAL_INFLUENCE_COEFF": {"values": [0.1, 1.0]},  # Intrinsic reward coefficient
+            "SUPERVISED_LOSS_COEF": {"values": [0.1, 1.0]},  # Supervised learning loss coefficient
             
             # Fixed parameters
-            # "USE_TOM": {"values": [True]},  # Enable ToM (needed for both configs)
             "USE_COMM": {"values": [True]},  # Always use communication
-            "PARAMETER_SHARING": {"values": [False]},  # Parameter sharing enabled
-            "USE_SEPARATE_REWARDS": {"values": [False]},  # Separate rewards for action and comm
+            "PARAMETER_SHARING": {"values": [False]},  # Non-parameter-sharing
+            "USE_SEPARATE_REWARDS": {"values": [False]},  # Joint reward
             "INFLUENCE_TARGET": {"values": ["belief"]},  # Belief-based influence
-            "SEED": {"values": [110]},  # Single seed for sweep (can be extended)
+            "SEED": {"values": [110]},  # Fixed seed
             "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
-            "SUPERVISED_LOSS_COEF": {"values": [0.1]},  # Fixed coefficient for supervised loss
-            "COMM_LOSS_COEF": {"values": [0.1]},  # Fixed coefficient for comm loss
+            "USE_TOM": {"values": [True]},  # Enable ToM
+            "SUPERVISED_BELIEF": {"values": ["llm"]},  # Supervised belief with LLM
+            "USE_INTRINSIC_REWARD": {"values": [True]},  # Enable intrinsic reward
         },
     }
 
@@ -3139,68 +3148,51 @@ def tune(default_config):
             else:
                 config[k] = v
         
-        # Get configuration type
-        config_type = config.get("CONFIG_TYPE", "tom_llm_intrinsic")
-        
-        # Set configuration based on type
-        if config_type == "tom_llm_intrinsic":
-            # Configuration 1: ToM supervised on LLM beliefs + Intrinsic reward
-            config["USE_TOM"] = True
-            config["SUPERVISED_BELIEF"] = "llm"
-            config["SUPERVISED_COMM"] = "none"
-            config["USE_INTRINSIC_REWARD"] = True
-            config["SOCIAL_INFLUENCE_COEFF"] = 0.1
-            config_name = "ToM_LLM_Beliefs_Intrinsic"
-            tags = ["LGTOM", "COMM", "PS", "LLM_BELIEF", "INTRINSIC", "TOM_SUPERVISED"]
-        elif config_type == "comm_llm_no_intrinsic":
-            # Configuration 2: Communication supervised on LLM communication + No Intrinsic reward
-            config["USE_TOM"] = False
-            config["SUPERVISED_COMM"] = "llm"
-            config["SUPERVISED_BELIEF"] = "none"
-            config["USE_INTRINSIC_REWARD"] = False
-            config["SOCIAL_INFLUENCE_COEFF"] = 0.0
-            config_name = "Comm_LLM_NoIntrinsic"
-            tags = ["LGTOM", "COMM", "PS", "LLM_COMM", "NO_INTRINSIC", "COMM_SUPERVISED"]
-        else:
-            raise ValueError(f"Unknown CONFIG_TYPE: {config_type}")
-        
-        # Ensure fixed settings
-        # config["USE_COMM"] = True
-        # config["USE_TOM"] = True
-        # config["PARAMETER_SHARING"] = True
-        # config["USE_SEPARATE_REWARDS"] = True
-        # config["INFLUENCE_TARGET"] = "belief"
+        # Ensure fixed settings are set
+        config["USE_COMM"] = True
+        config["PARAMETER_SHARING"] = False
+        config["USE_SEPARATE_REWARDS"] = False
+        config["INFLUENCE_TARGET"] = "belief"
+        config["USE_TOM"] = True
+        config["SUPERVISED_BELIEF"] = "llm"
+        config["SUPERVISED_COMM"] = "none"
+        config["USE_INTRINSIC_REWARD"] = True
         
         # Ensure LLM dataset path is set (required for LLM supervision)
         if not config.get("LLM_DATA_PATH", ""):
             print("Warning: LLM_DATA_PATH not set. LLM supervision will be disabled.")
         
         # Build descriptive run name
-        run_name = f"{config_name}_s{config['SEED']}"
+        comm_coef = config.get("COMM_LOSS_COEF", 0.1)
+        intrinsic_coef = config.get("SOCIAL_INFLUENCE_COEFF", 0.1)
+        supervised_coef = config.get("SUPERVISED_LOSS_COEF", 0.1)
+        run_name = f"comm{comm_coef}_intr{intrinsic_coef}_sup{supervised_coef}_s{config['SEED']}"
         wandb.run.name = run_name
         
+        tags = ["LGTOM", "COMM", "NON_PS", "JOINT_REWARD", "LLM_BELIEF", "INTRINSIC", "TOM_SUPERVISED", "COEFF_SWEEP"]
         wandb.run.tags = tags
         
         # Log configuration to wandb config
         wandb.config.update({
-            "CONFIG_TYPE": config_type,
             "USE_TOM": config.get("USE_TOM", False),
             "SUPERVISED_BELIEF": config.get("SUPERVISED_BELIEF", "none"),
             "SUPERVISED_COMM": config.get("SUPERVISED_COMM", "none"),
             "USE_INTRINSIC_REWARD": config.get("USE_INTRINSIC_REWARD", False),
             "SOCIAL_INFLUENCE_COEFF": config.get("SOCIAL_INFLUENCE_COEFF", 0.0),
+            "COMM_LOSS_COEF": config.get("COMM_LOSS_COEF", 0.1),
+            "SUPERVISED_LOSS_COEF": config.get("SUPERVISED_LOSS_COEF", 0.1),
         })
         
         print("="*70)
-        print(f"Running LLM supervision sweep experiment: {run_name}")
-        print(f"  Configuration: {config_type}")
+        print(f"Running coefficient sweep experiment: {run_name}")
+        print(f"  COMM_LOSS_COEF: {comm_coef}")
+        print(f"  SOCIAL_INFLUENCE_COEFF: {intrinsic_coef}")
+        print(f"  SUPERVISED_LOSS_COEF: {supervised_coef}")
         print(f"  USE_TOM: {config.get('USE_TOM', False)}")
         print(f"  SUPERVISED_BELIEF: {config.get('SUPERVISED_BELIEF', 'none')}")
-        print(f"  SUPERVISED_COMM: {config.get('SUPERVISED_COMM', 'none')}")
         print(f"  USE_INTRINSIC_REWARD: {config.get('USE_INTRINSIC_REWARD', False)}")
-        print(f"  SOCIAL_INFLUENCE_COEFF: {config.get('SOCIAL_INFLUENCE_COEFF', 0.0)}")
         print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', False)}")
-        print(f"  USE_SEPARATE_REWARDS: {config.get('USE_SEPARATE_REWARDS', True)}")
+        print(f"  USE_SEPARATE_REWARDS: {config.get('USE_SEPARATE_REWARDS', False)}")
         print(f"  INFLUENCE_TARGET: {config.get('INFLUENCE_TARGET', 'belief')}")
         print(f"  LLM_DATA_PATH: {config.get('LLM_DATA_PATH', 'Not set')}")
         print(f"  SEED: {config['SEED']}")
@@ -3223,7 +3215,7 @@ def tune(default_config):
         
         # Optional: Save checkpoint and evaluate
         # Uncomment if you want to save models during sweep
-        # filename = f"{config['ENV_NAME']}_{config_type}_seed{config['SEED']}"
+        # filename = f"{config['ENV_NAME']}_comm{comm_coef}_intr{intrinsic_coef}_sup{supervised_coef}_seed{config['SEED']}"
         # if config.get("PARAMETER_SHARING", True):
         #     save_path = f"./checkpoints/sweep/{filename}.pkl"
         #     save_params(train_state, save_path)
@@ -3237,33 +3229,26 @@ def tune(default_config):
         sweep_config, entity=default_config["ENTITY"], project=default_config["PROJECT"]
     )
     
-    total_runs = 2  # Two configurations
+    total_runs = 8  # 2 × 2 × 2 = 8 configurations
     
     print("\n" + "="*70)
-    print("Starting WandB Sweep: LLM Supervision Experiments")
+    print("Starting WandB Sweep: Coefficient Ablation Study")
     print(f"Sweep ID: {sweep_id}")
     print(f"Total Configurations: {total_runs}")
-    print(f"\nConfiguration 1: ToM supervised on LLM beliefs + Intrinsic reward")
-    print(f"  - USE_TOM: True (required for belief supervision)")
-    print(f"  - SUPERVISED_BELIEF: 'llm'")
-    print(f"  - SUPERVISED_COMM: 'none'")
-    print(f"  - USE_INTRINSIC_REWARD: True")
-    print(f"  - SOCIAL_INFLUENCE_COEFF: 0.1")
-    print(f"\nConfiguration 2: Communication supervised on LLM communication + No Intrinsic reward")
-    print(f"  - USE_TOM: False (required for communication supervision)")
-    print(f"  - SUPERVISED_COMM: 'llm'")
-    print(f"  - SUPERVISED_BELIEF: 'none'")
-    print(f"  - USE_INTRINSIC_REWARD: False")
-    print(f"  - SOCIAL_INFLUENCE_COEFF: 0.0")
+    print(f"\nSweep Parameters:")
+    print(f"  - COMM_LOSS_COEF: [0.1, 1.0]")
+    print(f"  - SOCIAL_INFLUENCE_COEFF: [0.1, 1.0]")
+    print(f"  - SUPERVISED_LOSS_COEF: [0.1, 1.0]")
     print(f"\nFixed Settings:")
     print(f"  - USE_COMM: True (communication enabled)")
-    print(f"  - PARAMETER_SHARING: False (independent agents)")
-    print(f"  - USE_SEPARATE_REWARDS: True (separate rewards for action and comm)")
+    print(f"  - PARAMETER_SHARING: False (non-parameter-sharing)")
+    print(f"  - USE_SEPARATE_REWARDS: False (joint_reward)")
     print(f"  - INFLUENCE_TARGET: 'belief' (belief-based influence)")
-    print(f"  - SUPERVISED_LOSS_COEF: 0.1")
-    print(f"  - COMM_LOSS_COEF: 0.1")
-    print(f"  - SEED: {default_config.get('SEED', 42)}")
-    print(f"  - Individual rewards (not shared)")
+    print(f"  - SEED: 110")
+    print(f"  - ENV_KWARGS.shared_rewards: False (individual rewards)")
+    print(f"  - USE_TOM: True")
+    print(f"  - SUPERVISED_BELIEF: 'llm' (supervised belief with LLM)")
+    print(f"  - USE_INTRINSIC_REWARD: True")
     print(f"\nTimesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
     print(f"Total runs: {total_runs}")
     print("="*70 + "\n")

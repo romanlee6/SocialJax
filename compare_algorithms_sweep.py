@@ -1,34 +1,32 @@
 """
-Unified WandB Sweep Script to Compare LG-TOM, InfoPG, and AutoEncoder
+Unified WandB Sweep Script to Compare LG-TOM variants, InfoPG, and AutoEncoder
 on Coin Game with consistent hyperparameters.
 
 Usage:
     python compare_algorithms_sweep.py
 
-This will create a WandB sweep with 5 experiments:
-1. LG-TOM: no_ToM + no_Intrinsic
-2. LG-TOM: No_ToM + Intrinsic (intrinsic_coef=0.1, COMM_LOSS_COEF=1)
-3. LG-TOM: ToM + Intrinsic (intrinsic_coef=0.1, COMM_LOSS_COEF=1, supervised_loss_coeff=1)
-4. InfoPG: k=1
+This will create a WandB sweep with 6 experiments × 5 seeds = 30 total runs:
+1. Social Influence: use_ToM, ground_truth_supervision, use intrinsic
+2. LG-ToM: use_ToM, llm_supervision, use intrinsic
+3. LangGround: no_ToM, llm_supervision on communication, no intrinsic
+4. Proto: no_ToM, no intrinsic
 5. AutoEncoder: AUTOENCODER_LOSS_COEF=1
+6. InfoPG: k=1
 
 Common Settings:
 - Individual rewards (shared_rewards=False)
 - No parameter sharing (PARAMETER_SHARING=False)
-- Seed: 110
+- Joint rewards (USE_SEPARATE_REWARDS=False)
+- Influence target=belief
+- Seeds: [1, 2, 3, 4, 5] (swept over)
 - Total timesteps: 1e8
 - NUM_ENVS: 512 (unified across all methods)
+- Communication enabled (USE_COMM=True)
 
-LG-TOM Variants:
-1. no_ToM + no_Intrinsic
-2. No_ToM + Intrinsic (intrinsic_coef=0.1, COMM_LOSS_COEF=1)
-3. ToM + Intrinsic (intrinsic_coef=0.1, COMM_LOSS_COEF=1, supervised_loss_coeff=1)
-
-AutoEncoder:
-- reconstructed_embedding_loss_coef = 1 (AUTOENCODER_LOSS_COEF=1)
-
-InfoPG:
-- Standard InfoPG with k=1
+When available:
+- comm loss coef = 1
+- intrinsic coef = 1 (SOCIAL_INFLUENCE_COEFF=1)
+- supervised coefficient = 0.1 (SUPERVISED_LOSS_COEF=0.1)
 """
 import sys
 import os
@@ -36,6 +34,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import jax
 import jax.numpy as jnp
+# Configure JAX for reproducibility
+jax.config.update("jax_default_prng_impl", "rbg")  # Use ThreeFry PRNG for reproducibility
 import wandb
 import copy
 from omegaconf import OmegaConf
@@ -96,10 +96,11 @@ def load_config(algorithm_name):
 def create_base_config():
     """Create base configuration with common settings"""
     return {
-        "SEED": 110,
-        "TOTAL_TIMESTEPS": 1e8,
+        "SEED": 1,  # Default seed, will be overridden by sweep parameter
+        "TOTAL_TIMESTEPS": 5e7,
         "REWARD": "individual",
         "PARAMETER_SHARING": False,
+        "USE_SEPARATE_REWARDS": False,  # Joint rewards
         "ENV_KWARGS": {
             "shared_rewards": False,
             "num_agents": 2,
@@ -141,27 +142,41 @@ def configure_lgtom(config, variant):
     config["HIDDEN_DIM"] = 128
     config["COMM_MODE"] = "avg"
     config["INFLUENCE_TARGET"] = "belief"
-    config["USE_SEPARATE_REWARDS"] = True
+    config["USE_SEPARATE_REWARDS"] = False  # Joint rewards
     config["COMM_LOSS_COEF"] = 1
     
-    if variant == "no_tom_no_intrinsic":
+    if variant == "social_influence":
+        # Condition 1: use_ToM, ground_truth_supervision, use intrinsic
+        config["USE_TOM"] = True
+        config["USE_INTRINSIC_REWARD"] = True
+        config["SOCIAL_INFLUENCE_COEFF"] = 1.0
+        config["SUPERVISED_BELIEF"] = "ground_truth"
+        config["SUPERVISED_COMM"] = "none"
+        config["SUPERVISED_LOSS_COEF"] = 0.1
+    elif variant == "lgtom":
+        # Condition 2: use_ToM, llm_supervision, use intrinsic
+        config["USE_TOM"] = True
+        config["USE_INTRINSIC_REWARD"] = True
+        config["SOCIAL_INFLUENCE_COEFF"] = 1.0
+        config["SUPERVISED_BELIEF"] = "llm"
+        config["SUPERVISED_COMM"] = "none"
+        config["SUPERVISED_LOSS_COEF"] = 0.1
+    elif variant == "langground":
+        # Condition 3: no_ToM, llm_supervision on communication, no intrinsic
         config["USE_TOM"] = False
         config["USE_INTRINSIC_REWARD"] = False
         config["SOCIAL_INFLUENCE_COEFF"] = 0.0
         config["SUPERVISED_BELIEF"] = "none"
-        config["SUPERVISED_LOSS_COEF"] = 0.0
-    elif variant == "no_tom_intrinsic":
+        config["SUPERVISED_COMM"] = "llm"
+        config["SUPERVISED_LOSS_COEF"] = 0.1
+    elif variant == "proto":
+        # Condition 4: no_ToM, no intrinsic
         config["USE_TOM"] = False
-        config["USE_INTRINSIC_REWARD"] = True
-        config["SOCIAL_INFLUENCE_COEFF"] = 0.1
+        config["USE_INTRINSIC_REWARD"] = False
+        config["SOCIAL_INFLUENCE_COEFF"] = 0.0
         config["SUPERVISED_BELIEF"] = "none"
+        config["SUPERVISED_COMM"] = "none"
         config["SUPERVISED_LOSS_COEF"] = 0.0
-    elif variant == "tom_intrinsic":
-        config["USE_TOM"] = True
-        config["USE_INTRINSIC_REWARD"] = True
-        config["SOCIAL_INFLUENCE_COEFF"] = 0.1
-        config["SUPERVISED_BELIEF"] = "ground_truth"
-        config["SUPERVISED_LOSS_COEF"] = 1.0
     else:
         raise ValueError(f"Unknown LG-TOM variant: {variant}")
     
@@ -182,7 +197,7 @@ def configure_autoencoder(config):
     config["HIDDEN_DIM"] = 128
     config["COMM_MODE"] = "avg"
     config["AUTOENCODER_LOSS_COEF"] = 1  # reconstructed_embedding_loss_coef
-    config["USE_SEPARATE_REWARDS"] = False
+    config["USE_SEPARATE_REWARDS"] = False  # Joint rewards
     config["COMM_LOSS_COEF"] = 1
     return config
 
@@ -214,14 +229,16 @@ def wrapped_make_train():
     
     # Get sweep parameters
     experiment_id = wandb.config.experiment_id
+    seed = wandb.config.SEED
     
     # Define all experiments explicitly
     experiments = {
-        0: {"algorithm": "lgtom", "variant": "no_tom_no_intrinsic"},
-        1: {"algorithm": "lgtom", "variant": "no_tom_intrinsic"},
-        2: {"algorithm": "lgtom", "variant": "tom_intrinsic"},
-        3: {"algorithm": "infopg", "variant": None},
-        4: {"algorithm": "autoencoder", "variant": None},
+        0: {"algorithm": "lgtom", "variant": "social_influence", "name": "Social Influence"},
+        1: {"algorithm": "lgtom", "variant": "lgtom", "name": "LG-ToM"},
+        2: {"algorithm": "lgtom", "variant": "langground", "name": "LangGround"},
+        3: {"algorithm": "lgtom", "variant": "proto", "name": "Proto"},
+        4: {"algorithm": "autoencoder", "variant": None, "name": "AutoEncoder"},
+        5: {"algorithm": "infopg", "variant": None, "name": "InfoPG"},
     }
     
     if experiment_id not in experiments:
@@ -237,6 +254,9 @@ def wrapped_make_train():
     # Create unified base config with common settings
     unified_config = create_base_config()
     
+    # Override seed with sweep parameter
+    unified_config["SEED"] = seed
+    
     # Merge with algorithm-specific defaults
     for key, value in base_config.items():
         if key not in unified_config or key in ["ENV_KWARGS"]:
@@ -246,16 +266,19 @@ def wrapped_make_train():
                 unified_config[key] = value
     
     # Apply algorithm-specific configuration
+    experiment_name = experiment.get("name", variant or algorithm)
     if algorithm == "lgtom":
         unified_config = configure_lgtom(unified_config, variant)
-        run_name = f"lgtom_{variant}_s{unified_config['SEED']}"
-        tags = ["LGTOM", "COMM", "IND", "INDIVIDUAL_REWARD"]
-        if variant == "no_tom_no_intrinsic":
+        run_name = f"{variant}_s{unified_config['SEED']}"
+        tags = ["LGTOM", "COMM", "IND", "INDIVIDUAL_REWARD", "JOINT_REWARD", "BELIEF"]
+        if variant == "social_influence":
+            tags.extend(["TOM", "INTRINSIC", "GROUND_TRUTH", f"INTR_COEF_{unified_config['SOCIAL_INFLUENCE_COEFF']}"])
+        elif variant == "lgtom":
+            tags.extend(["TOM", "INTRINSIC", "LLM_SUPERVISION", f"INTR_COEF_{unified_config['SOCIAL_INFLUENCE_COEFF']}"])
+        elif variant == "langground":
+            tags.extend(["NO_TOM", "NO_INTRINSIC", "LLM_COMM"])
+        elif variant == "proto":
             tags.extend(["NO_TOM", "NO_INTRINSIC"])
-        elif variant == "no_tom_intrinsic":
-            tags.extend(["NO_TOM", "INTRINSIC", f"COEF_{unified_config['SOCIAL_INFLUENCE_COEFF']}"])
-        elif variant == "tom_intrinsic":
-            tags.extend(["TOM", "INTRINSIC", f"COEF_{unified_config['SOCIAL_INFLUENCE_COEFF']}", "SUPERVISED_BELIEF"])
     elif algorithm == "infopg":
         unified_config = configure_infopg(unified_config)
         run_name = f"infopg_k{unified_config['K_LEVELS']}_s{unified_config['SEED']}"
@@ -263,7 +286,7 @@ def wrapped_make_train():
     elif algorithm == "autoencoder":
         unified_config = configure_autoencoder(unified_config)
         run_name = f"autoencoder_ae{unified_config['AUTOENCODER_LOSS_COEF']}_s{unified_config['SEED']}"
-        tags = ["AUTOENCODER", "COMM", "IND", "INDIVIDUAL_REWARD", f"AE_COEF_{unified_config['AUTOENCODER_LOSS_COEF']}"]
+        tags = ["AUTOENCODER", "COMM", "IND", "INDIVIDUAL_REWARD", "JOINT_REWARD", f"AE_COEF_{unified_config['AUTOENCODER_LOSS_COEF']}"]
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
     
@@ -273,23 +296,30 @@ def wrapped_make_train():
     
     # Log configuration
     print("="*70)
-    print(f"Running experiment: {run_name}")
+    print(f"Running experiment: {experiment_name} ({run_name})")
     print(f"  Algorithm: {algorithm}")
     if variant:
         print(f"  Variant: {variant}")
     print(f"  SEED: {unified_config['SEED']}")
     print(f"  TOTAL_TIMESTEPS: {unified_config['TOTAL_TIMESTEPS']:.0e}")
     print(f"  PARAMETER_SHARING: {unified_config['PARAMETER_SHARING']}")
+    print(f"  USE_SEPARATE_REWARDS: {unified_config.get('USE_SEPARATE_REWARDS', False)}")
     print(f"  Individual Rewards: {not unified_config['ENV_KWARGS']['shared_rewards']}")
     if algorithm == "lgtom":
         print(f"  USE_TOM: {unified_config.get('USE_TOM', False)}")
         print(f"  USE_INTRINSIC_REWARD: {unified_config.get('USE_INTRINSIC_REWARD', False)}")
+        print(f"  INFLUENCE_TARGET: {unified_config.get('INFLUENCE_TARGET', 'belief')}")
+        print(f"  COMM_LOSS_COEF: {unified_config.get('COMM_LOSS_COEF', 0.0)}")
         if unified_config.get('USE_INTRINSIC_REWARD', False):
             print(f"  SOCIAL_INFLUENCE_COEFF: {unified_config.get('SOCIAL_INFLUENCE_COEFF', 0.0)}")
         if unified_config.get('USE_TOM', False):
+            print(f"  SUPERVISED_BELIEF: {unified_config.get('SUPERVISED_BELIEF', 'none')}")
             print(f"  SUPERVISED_LOSS_COEF: {unified_config.get('SUPERVISED_LOSS_COEF', 0.0)}")
+        if unified_config.get('SUPERVISED_COMM', 'none') != 'none':
+            print(f"  SUPERVISED_COMM: {unified_config.get('SUPERVISED_COMM', 'none')}")
     elif algorithm == "autoencoder":
         print(f"  AUTOENCODER_LOSS_COEF: {unified_config.get('AUTOENCODER_LOSS_COEF', 0.0)}")
+        print(f"  COMM_LOSS_COEF: {unified_config.get('COMM_LOSS_COEF', 0.0)}")
     print(f"  Tags: {tags}")
     print("="*70)
     
@@ -314,7 +344,10 @@ def main():
         },
         "parameters": {
             "experiment_id": {
-                "values": [0, 1, 2, 3, 4]  # 5 experiments total
+                "values": [0, 1, 2, 3, 4, 5]  # 6 experiments total
+            },
+            "SEED": {
+                "values": [1, 2, 3, 4, 5]  # 5 seeds
             }
         },
     }
@@ -333,20 +366,29 @@ def main():
     print("Starting WandB Sweep: Algorithm Comparison on Coin Game")
     print(f"Sweep ID: {sweep_id}")
     print(f"\nExperiments:")
-    print(f"  0. LG-TOM: no_ToM + no_Intrinsic")
-    print(f"  1. LG-TOM: No_ToM + Intrinsic (coef=0.1, COMM_LOSS_COEF=1)")
-    print(f"  2. LG-TOM: ToM + Intrinsic (coef=0.1, COMM_LOSS_COEF=1, supervised_loss_coeff=1)")
-    print(f"  3. InfoPG: k=1")
+    print(f"  0. Social Influence: use_ToM, ground_truth_supervision, use intrinsic")
+    print(f"  1. LG-ToM: use_ToM, llm_supervision, use intrinsic")
+    print(f"  2. LangGround: no_ToM, llm_supervision on communication, no intrinsic")
+    print(f"  3. Proto: no_ToM, no intrinsic")
     print(f"  4. AutoEncoder: AUTOENCODER_LOSS_COEF=1")
+    print(f"  5. InfoPG: k=1")
     print(f"\nCommon Settings:")
-    print(f"  - Seed: 110")
+    print(f"  - Seeds: [1, 2, 3, 4, 5] (swept over)")
     print(f"  - Total Timesteps: 1e8")
     print(f"  - Individual Rewards (shared_rewards=False)")
     print(f"  - No Parameter Sharing (PARAMETER_SHARING=False)")
+    print(f"  - Joint Rewards (USE_SEPARATE_REWARDS=False)")
+    print(f"  - Influence Target: belief")
+    print(f"  - Communication: Enabled (USE_COMM=True)")
+    print(f"\nWhen Available:")
+    print(f"  - COMM_LOSS_COEF: 1")
+    print(f"  - SOCIAL_INFLUENCE_COEFF: 1")
+    print(f"  - SUPERVISED_LOSS_COEF: 0.1")
+    print(f"\nTotal Runs: 6 experiments × 5 seeds = 30 runs")
     print("="*70 + "\n")
     
-    # Run sweep agent - 5 experiments total
-    wandb.agent(sweep_id, wrapped_make_train, count=5)
+    # Run sweep agent - 6 experiments × 5 seeds = 30 total runs
+    wandb.agent(sweep_id, wrapped_make_train, count=30)
 
 if __name__ == "__main__":
     main()

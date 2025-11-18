@@ -912,8 +912,10 @@ def make_train_comm(config):
                 train_mode=True
             )
         else:
+            # Split RNG for each agent to ensure reproducibility
+            init_rngs = jax.random.split(_rng, env.num_agents)
             network_params = [network[i].init(
-                {'params': _rng, 'gumbel': _rng},
+                {'params': init_rngs[i], 'gumbel': init_rngs[i]},
                 init_obs,
                 init_comm,
                 init_hidden,
@@ -1458,8 +1460,10 @@ def make_train_comm(config):
             else:
                 update_state_dict = []
                 metric = []
+                # Split RNG for each agent to ensure reproducibility
+                agent_rngs = jax.random.split(rng, env.num_agents)
                 for i in range(env.num_agents):
-                    update_state = (train_state[i], traj_batch[i], action_advantages[i], comm_advantages[i], targets[i], rng)
+                    update_state = (train_state[i], traj_batch[i], action_advantages[i], comm_advantages[i], targets[i], agent_rngs[i])
                     update_state, loss_info = jax.lax.scan(
                         lambda state, unused: _update_epoch(state, unused, i), update_state, None, config["UPDATE_EPOCHS"]
                     )
@@ -1468,7 +1472,8 @@ def make_train_comm(config):
                     metric_i = traj_batch[i].info
                     metric_i['loss'] = loss_info[0]
                     metric.append(metric_i)
-                    rng = update_state[-1]
+                # Combine RNGs from all agents deterministically
+                rng = update_state_dict[-1][-1]  # Use the last agent's RNG as the final RNG
             
             def callback(metric):
                 # Convert all JAX arrays to Python scalars for wandb
@@ -1566,7 +1571,9 @@ def make_train(config):
         if config["PARAMETER_SHARING"]:
             network_params = network.init(_rng, init_x)
         else:
-            network_params = [network[i].init(_rng, init_x) for i in range(env.num_agents)]
+            # Split RNG for each agent to ensure reproducibility
+            init_rngs = jax.random.split(_rng, env.num_agents)
+            network_params = [network[i].init(init_rngs[i], init_x) for i in range(env.num_agents)]
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -1830,8 +1837,10 @@ def make_train(config):
             else:
                 update_state_dict = []
                 metric = []
+                # Split RNG for each agent to ensure reproducibility
+                agent_rngs = jax.random.split(rng, env.num_agents)
                 for i in range(env.num_agents):
-                    update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], rng)
+                    update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], agent_rngs[i])
                     update_state, loss_info = jax.lax.scan(
                         lambda state, unused: _update_epoch(state, unused, i), update_state, None, config["UPDATE_EPOCHS"]
                     )
@@ -1840,7 +1849,8 @@ def make_train(config):
                     metric_i = traj_batch[i].info
                     metric_i['loss'] = loss_info[0]
                     metric.append(metric_i)
-                    rng = update_state[-1]
+                # Combine RNGs from all agents deterministically
+                rng = update_state_dict[-1][-1]  # Use the last agent's RNG as the final RNG
                 
             def callback(metric):
                 # Convert all JAX arrays to Python scalars for wandb

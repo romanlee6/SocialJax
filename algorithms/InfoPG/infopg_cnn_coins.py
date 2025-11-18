@@ -254,8 +254,10 @@ def make_train(config):
         init_x = jnp.zeros((1, *(env.observation_space()[0]).shape))
         init_latents = jnp.zeros((1, env.num_agents - 1, latent_size))  # For k-level communication
 
+        # Split RNG for each agent to ensure reproducibility
+        init_rngs = jax.random.split(_rng, env.num_agents)
         network_params = [
-            network[i].init(_rng, init_x, init_latents, k_levels) 
+            network[i].init(init_rngs[i], init_x, init_latents, k_levels) 
             for i in range(env.num_agents)
         ]
         
@@ -550,8 +552,10 @@ def make_train(config):
             # Update each agent separately (non-parameter sharing)
             update_state_dict = []
             metric = []
+            # Split RNG for each agent to ensure reproducibility
+            agent_rngs = jax.random.split(rng, env.num_agents)
             for i in range(env.num_agents):
-                update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], rng)
+                update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], agent_rngs[i])
                 update_state, loss_info = jax.lax.scan(
                     lambda state, unused: _update_epoch(state, unused, i), 
                     update_state, 
@@ -563,7 +567,8 @@ def make_train(config):
                 metric_i = traj_batch[i].info
                 metric_i['loss'] = loss_info[0]
                 metric.append(metric_i)
-                rng = update_state[-1]
+            # Combine RNGs from all agents deterministically
+            rng = update_state_dict[-1][-1]  # Use the last agent's RNG as the final RNG
                 
             def callback(metric):
                 wandb.log(metric)
