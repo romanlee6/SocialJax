@@ -670,32 +670,32 @@ class CoopMining(MultiAgentEnv):
                 "original_rewards": final_rewards.squeeze(),
                 "shaped_rewards": final_rewards.squeeze(),
             }
-        elif self.inequity_aversion:
-            final_rewards = (rewards_iron + rewards_gold) * self.num_agents # (N,)
-            if self.smooth_rewards:
-                should_smooth = (state.inner_t % 1) == 0
-                new_smooth_rewards = 0.99 * 0.99 * state.smooth_rewards + final_rewards
-                rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(new_smooth_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
-                state = state.replace(smooth_rewards=new_smooth_rewards)
-                info = {
-                "original_rewards": final_rewards.squeeze(),
-                "smooth_rewards": state.smooth_rewards.squeeze(),
-                "shaped_rewards": rewards.squeeze(),
-            }
-            else:
-                rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(final_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
-                info = {
-                "original_rewards": final_rewards.squeeze(),
-                "shaped_rewards": rewards.squeeze(),
-            }
-        elif self.svo:
-            final_rewards = (rewards_iron + rewards_gold) * self.num_agents # (N,)
-            rewards, theta = self.get_svo_rewards(final_rewards, self.svo_w, self.svo_ideal_angle_degrees, self.svo_target_agents)
-            info = {
-                "original_rewards": final_rewards.squeeze(),
-                "svo_theta": theta.squeeze(),
-                "shaped_rewards": rewards.squeeze(),
-            }
+        # elif self.inequity_aversion:
+        #     final_rewards = (rewards_iron + rewards_gold) * self.num_agents # (N,)
+        #     if self.smooth_rewards:
+        #         should_smooth = (state.inner_t % 1) == 0
+        #         new_smooth_rewards = 0.99 * 0.99 * state.smooth_rewards + final_rewards
+        #         rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(new_smooth_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
+        #         state = state.replace(smooth_rewards=new_smooth_rewards)
+        #         info = {
+        #         "original_rewards": final_rewards.squeeze(),
+        #         "smooth_rewards": state.smooth_rewards.squeeze(),
+        #         "shaped_rewards": rewards.squeeze(),
+        #     }
+        #     else:
+        #         rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(final_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
+        #         info = {
+        #         "original_rewards": final_rewards.squeeze(),
+        #         "shaped_rewards": rewards.squeeze(),
+        #     }
+        # elif self.svo:
+        #     final_rewards = (rewards_iron + rewards_gold) * self.num_agents # (N,)
+        #     rewards, theta = self.get_svo_rewards(final_rewards, self.svo_w, self.svo_ideal_angle_degrees, self.svo_target_agents)
+        #     info = {
+        #         "original_rewards": final_rewards.squeeze(),
+        #         "svo_theta": theta.squeeze(),
+        #         "shaped_rewards": rewards.squeeze(),
+        #     }
         else:
             final_rewards = (rewards_iron + rewards_gold) * self.num_agents # (N,)
             info = {}

@@ -1,0 +1,10 @@
+{
+  "total_entries": 2200,
+  "unique_keys": 1224,
+  "keys_with_multiple_values": 375,
+  "repeated_key_assignments": 976,
+  "total_trajectory_files": 11,
+  "embedding_dim": 256,
+  "game_type": "coins",
+  "filter_prefix": "gpt-5.1"
+}

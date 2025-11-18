@@ -342,6 +342,8 @@ class TransitionComm(NamedTuple):
     tom_prediction: jnp.ndarray  # ToM predictions (if enabled) for supervised learning
     prev_comm: jnp.ndarray  # Received/aggregated communication that was used as input
     info: jnp.ndarray
+    agent_positions: jnp.ndarray  # (num_envs * num_agents, 2) - [x, y] positions for semantic key
+    closest_coin_colors: jnp.ndarray  # (num_envs * num_agents,) - closest coin color indices (0=none, 1=red, 2=green)
 
 
 class Transition(NamedTuple):
@@ -758,6 +760,113 @@ def compute_supervised_belief_loss(tom_predictions, ground_truth_beliefs, config
     return loss
 
 
+def find_closest_coin_in_fov_jax(agent_x, agent_y, agent_direction, grid):
+    """
+    Find the closest coin in the agent's field of view (JAX-compatible).
+    
+    Args:
+        agent_x: jnp.ndarray or int, agent x position
+        agent_y: jnp.ndarray or int, agent y position
+        agent_direction: jnp.ndarray or int, agent direction (0=North, 1=West, 2=South, 3=East)
+        grid: jnp.ndarray, grid state (H, W)
+        
+    Returns:
+        coin_color_idx: int, 0=none, 1=red, 2=green
+    """
+    # Convert to JAX arrays if needed
+    agent_x = jnp.asarray(agent_x, dtype=jnp.int32)
+    agent_y = jnp.asarray(agent_y, dtype=jnp.int32)
+    agent_direction = jnp.asarray(agent_direction, dtype=jnp.int32)
+    # FOV parameters
+    forward_range = 9
+    backward_range = 1
+    left_range = 5
+    right_range = 5
+    
+    # Get grid dimensions
+    grid_h, grid_w = grid.shape
+    
+    # Create coordinate grids
+    x_coords = jnp.arange(grid_h)
+    y_coords = jnp.arange(grid_w)
+    X, Y = jnp.meshgrid(x_coords, y_coords, indexing='ij')
+    
+    # Compute relative positions
+    rel_x = X - agent_x
+    rel_y = Y - agent_y
+    
+    # Transform based on direction using JAX-compatible operations
+    # Direction 0=North, 1=West, 2=South, 3=East
+    # Use jnp.where for conditional logic
+    forward_north = rel_x
+    backward_north = -rel_x
+    left_north = rel_y
+    right_north = -rel_y
+    
+    forward_west = rel_y
+    backward_west = -rel_y
+    left_west = -rel_x
+    right_west = rel_x
+    
+    forward_south = -rel_x
+    backward_south = rel_x
+    left_south = -rel_y
+    right_south = rel_y
+    
+    forward_east = -rel_y
+    backward_east = rel_y
+    left_east = rel_x
+    right_east = -rel_x
+    
+    # Select based on direction
+    forward = jnp.where(agent_direction == 0, forward_north,
+               jnp.where(agent_direction == 1, forward_west,
+               jnp.where(agent_direction == 2, forward_south, forward_east)))
+    backward = jnp.where(agent_direction == 0, backward_north,
+                jnp.where(agent_direction == 1, backward_west,
+                jnp.where(agent_direction == 2, backward_south, backward_east)))
+    left = jnp.where(agent_direction == 0, left_north,
+            jnp.where(agent_direction == 1, left_west,
+            jnp.where(agent_direction == 2, left_south, left_east)))
+    right = jnp.where(agent_direction == 0, right_north,
+             jnp.where(agent_direction == 1, right_west,
+             jnp.where(agent_direction == 2, right_south, right_east)))
+    
+    # Check if in FOV
+    in_forward = (forward >= 0) & (forward <= forward_range)
+    in_backward = (backward >= 0) & (backward <= backward_range)
+    in_left = (left >= 0) & (left <= left_range)
+    in_right = (right >= 0) & (right <= right_range)
+    in_fov = (in_forward | in_backward) & (in_left | in_right)
+    
+    # Compute distances
+    distances = jnp.sqrt(rel_x**2 + rel_y**2)
+    distances = jnp.where(in_fov, distances, jnp.inf)
+    
+    # Find red coins (grid value 3)
+    red_coins = (grid == 3) & in_fov
+    red_distances = jnp.where(red_coins, distances, jnp.inf)
+    closest_red_dist = jnp.min(red_distances)
+    has_red = jnp.isfinite(closest_red_dist)
+    
+    # Find green coins (grid value 4)
+    green_coins = (grid == 4) & in_fov
+    green_distances = jnp.where(green_coins, distances, jnp.inf)
+    closest_green_dist = jnp.min(green_distances)
+    has_green = jnp.isfinite(closest_green_dist)
+    
+    # Return closest coin color index: 0=none, 1=red, 2=green
+    has_coin = has_red | has_green
+    red_closer = (closest_red_dist < closest_green_dist) & has_red
+    
+    coin_color_idx = jnp.where(
+        ~has_coin, 0,  # No coin
+        jnp.where(red_closer, 1, 2)  # Red or green
+    )
+    
+    return coin_color_idx
+
+
 def compute_supervised_comm_loss(comm_vectors, target_comm_vectors, config):
     """
     Compute supervised loss for communication based on cosine similarity.
@@ -781,56 +890,348 @@ def compute_supervised_comm_loss(comm_vectors, target_comm_vectors, config):
     return loss
 
 
+def normalize_l2(x):
+    """
+    Normalize vector(s) using L2 normalization.
+    
+    Args:
+        x: numpy array, 1D or 2D
+        
+    Returns:
+        Normalized array with same shape as input
+    """
+    x = np.array(x)
+    if x.ndim == 1:
+        norm = np.linalg.norm(x)
+        if norm == 0:
+            return x
+        return x / norm
+    else:
+        norm = np.linalg.norm(x, 2, axis=1, keepdims=True)
+        return np.where(norm == 0, x, x / norm)
+
+
 def load_offline_llm_dataset(data_path, env_name, config):
     """
     Load offline LLM dataset for supervised communication/belief training.
     
-    *** UNDER CONSTRUCTION ***
-    This function is a placeholder for loading pre-collected LLM interaction data.
-    
-    The dataset should contain:
-    - State observations
-    - Communication embeddings from LLM reasoning
-    - Belief state predictions
-    - Action distributions
-    
-    Expected format:
-    {
-        'observations': array of shape (N, obs_dim),
-        'communications': array of shape (N, comm_dim),
-        'beliefs': array of shape (N, hidden_dim),
-        'actions': array of shape (N, action_dim),
-        'state_keys': list of state tuples for indexing
+    The dataset uses semantic_key vectors as keys for O(1) lookup:
+    - Key: (color_encoded, x, y, coin_color_encoded, action_idx)
+    - Value: {
+        'belief_embedding': np.ndarray,
+        'communication_embedding': np.ndarray,
+        'belief_text': str,
+        'communication_text': str
     }
     
-    TODO:
-    - Define exact data format specification
-    - Implement data loading from pickle/numpy files
-    - Add data preprocessing and normalization
-    - Implement state matching/similarity functions
-    - Add caching for efficiency
+    This function creates a JAX-compatible dense embedding table for GPU-accelerated lookups.
     
     Args:
-        data_path: str, path to offline dataset
+        data_path: str, path to offline dataset (.pkl file)
         env_name: str, name of environment
         config: Configuration dict
         
     Returns:
-        dataset: dict containing offline data, or None if not available
+        dataset: dict with JAX embedding table and lookup function, or None if not available
     """
-    # PLACEHOLDER IMPLEMENTATION
-    print("="*70)
-    print("WARNING: Offline LLM dataset loading is UNDER CONSTRUCTION")
-    print("This feature is not yet fully implemented.")
-    print("To use supervised learning from LLM data:")
-    print("  1. Collect LLM trajectories using llms/coins_llm_simulation.py")
-    print("  2. Process and format the data into required structure")
-    print("  3. Implement data loading logic in this function")
-    print("  4. Set SUPERVISED_COMM or SUPERVISED_BELIEF to 'llm' in config")
-    print("="*70)
+    import pickle
+    import numpy as np
+    from pathlib import Path
     
-    # Return None to indicate dataset not available
-    return None
+    if not data_path or data_path == "":
+        return None
+    
+    data_path = Path(data_path)
+    if not data_path.exists():
+        print(f"Warning: LLM dataset not found at {data_path}")
+        return None
+    
+    try:
+        with open(data_path, 'rb') as f:
+            data = pickle.load(f)
+        
+        dataset = data.get('dataset', {})
+        embedding_dim = data.get('embedding_dim', 384)
+        color_to_idx = data.get('color_to_idx', {'red': 0, 'green': 1})
+        coin_color_to_idx = data.get('coin_color_to_idx', {'none': 0, 'red': 1, 'green': 2})
+        action_to_idx = data.get('action_to_idx', {
+            'turn_left': 0, 'turn_right': 1, 'left': 2, 'right': 3,
+            'up': 4, 'down': 5, 'stay': 6
+        })
+        
+        # Get grid size from config or use default for coins environment
+        # For coins: grid_size = (16, 11) -> x: 0-15, y: 0-10
+        if env_name == "CoinGame" or "coins" in env_name.lower():
+            grid_size_row, grid_size_col = 16, 11
+        else:
+            # Try to get from config, default to reasonable values
+            grid_size_row = config.get("GRID_SIZE_ROW", 16)
+            grid_size_col = config.get("GRID_SIZE_COL", 11)
+        
+        # Get target dimensions from config (shorten embeddings from 256 to target dims)
+        belief_target_dim = config.get("HIDDEN_DIM", 128)  # Default 128 for belief
+        comm_target_dim = config.get("COMM_DIM", 64)  # Default 64 for communication
+        
+        print(f"Loaded LLM dataset from {data_path}")
+        print(f"  Dataset size: {len(dataset)} entries")
+        print(f"  Embedding dimension (stored): {embedding_dim}")
+        print(f"  Belief target dimension: {belief_target_dim}")
+        print(f"  Communication target dimension: {comm_target_dim}")
+        print(f"  Grid size: ({grid_size_row}, {grid_size_col})")
+        
+        # Create dense embedding tables for JAX lookups with target dimensions
+        # Shape: (num_colors, grid_size_row, grid_size_col, num_coin_colors, num_actions, target_dim)
+        # num_colors = 2 (red=0, green=1)
+        # num_coin_colors = 3 (none=0, red=1, green=2)
+        # num_actions = 7 (0-6)
+        belief_embedding_table = np.zeros(
+            (2, grid_size_row, grid_size_col, 3, 7, belief_target_dim),
+            dtype=np.float32
+        )
+        comm_embedding_table = np.zeros(
+            (2, grid_size_row, grid_size_col, 3, 7, comm_target_dim),
+            dtype=np.float32
+        )
+        
+        # Fill embedding tables from dataset, truncating to target dimensions
+        filled_count = 0
+        for key_vector, entry in dataset.items():
+            color_encoded, x, y, coin_color_encoded, action = key_vector
+            
+            # Bounds checking
+            if (0 <= color_encoded < 2 and 
+                0 <= x < grid_size_row and 
+                0 <= y < grid_size_col and
+                0 <= coin_color_encoded < 3 and
+                0 <= action < 7):
+                
+                # Store belief embedding (truncate from embedding_dim to belief_target_dim)
+                if 'belief_embedding' in entry and entry['belief_embedding'] is not None:
+                    belief_emb = np.array(entry['belief_embedding'], dtype=np.float32)
+                    if belief_emb.shape[0] >= belief_target_dim:
+                        # Truncate by taking first belief_target_dim elements
+                        belief_emb_truncated = belief_emb[:belief_target_dim]
+                    else:
+                        # Pad with zeros if shorter than target
+                        belief_emb_truncated = np.pad(belief_emb, (0, belief_target_dim - belief_emb.shape[0]),
+                                                      mode='constant')
+                    # Normalize after truncation
+                    belief_emb_truncated = normalize_l2(belief_emb_truncated)
+                    belief_embedding_table[color_encoded, x, y, coin_color_encoded, action] = belief_emb_truncated
+                    filled_count += 1
+                
+                # Store communication embedding (truncate from embedding_dim to comm_target_dim)
+                if 'communication_embedding' in entry and entry['communication_embedding'] is not None:
+                    comm_emb = np.array(entry['communication_embedding'], dtype=np.float32)
+                    if comm_emb.shape[0] >= comm_target_dim:
+                        # Truncate by taking first comm_target_dim elements
+                        comm_emb_truncated = comm_emb[:comm_target_dim]
+                    else:
+                        # Pad with zeros if shorter than target
+                        comm_emb_truncated = np.pad(comm_emb, (0, comm_target_dim - comm_emb.shape[0]),
+                                                    mode='constant')
+                    # Normalize after truncation
+                    comm_emb_truncated = normalize_l2(comm_emb_truncated)
+                    comm_embedding_table[color_encoded, x, y, coin_color_encoded, action] = comm_emb_truncated
+        
+        print(f"  Filled {filled_count} entries in embedding tables")
+        
+        # Convert to JAX arrays
+        belief_embedding_table_jax = jnp.array(belief_embedding_table, dtype=jnp.float32)
+        comm_embedding_table_jax = jnp.array(comm_embedding_table, dtype=jnp.float32)
+        
+        def construct_semantic_key_vector(agent_id, agent_x, agent_y, closest_coin_color, action_idx):
+            """
+            Construct semantic key vector from agent state.
+            
+            Args:
+                agent_id: int, agent ID (0=red, 1=green)
+                agent_x: int, agent x position
+                agent_y: int, agent y position
+                closest_coin_color: str or None, closest coin color in FOV ('red', 'green', or None)
+                action_idx: int, action index
+                
+            Returns:
+                Tuple: (color_encoded, x, y, coin_color_encoded, action_idx)
+            """
+            # Encode color: agent 0 is red, agent 1 is green
+            color_encoded = 0 if agent_id == 0 else 1
+            
+            # Keep x, y as integers
+            x = int(agent_x)
+            y = int(agent_y)
+            
+            # Encode coin color
+            if closest_coin_color is None:
+                coin_color_encoded = 0
+            else:
+                coin_color_encoded = coin_color_to_idx.get(closest_coin_color.lower(), 0)
+            
+            # Action index
+            action = int(action_idx)
+            
+            return (color_encoded, x, y, coin_color_encoded, action)
+        
+        # Create separate jitted functions for belief and communication lookups
+        # (JAX jit doesn't work well with string-based conditionals)
+        @jax.jit
+        def lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices):
+            """
+            JAX-accelerated parallel belief embedding lookup.
+            
+            Args:
+                agent_ids: (N,) int array, agent IDs (0=red, 1=green)
+                agent_xs: (N,) int array, agent x positions
+                agent_ys: (N,) int array, agent y positions
+                coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
+                action_indices: (N,) int array, action indices (0-6)
+                
+            Returns:
+                (N, embedding_dim) float32 array of embeddings
+            """
+            # Encode agent IDs to colors: 0 -> 0 (red), 1 -> 1 (green)
+            color_indices = agent_ids
+            
+            # Clamp indices to valid ranges for safe indexing
+            color_indices = jnp.clip(color_indices, 0, 1)
+            x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
+            y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
+            coin_indices = jnp.clip(coin_color_indices, 0, 2)
+            action_indices_clipped = jnp.clip(action_indices, 0, 6)
+            
+            # Vectorized lookup: belief_embedding_table[color_indices, x_indices, y_indices, coin_indices, action_indices_clipped]
+            embeddings = belief_embedding_table_jax[
+                color_indices,
+                x_indices,
+                y_indices,
+                coin_indices,
+                action_indices_clipped
+            ]  # Shape: (N, belief_target_dim)
+            
+            return embeddings
+        
+        @jax.jit
+        def lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices):
+            """
+            JAX-accelerated parallel communication embedding lookup.
+            
+            Args:
+                agent_ids: (N,) int array, agent IDs (0=red, 1=green)
+                agent_xs: (N,) int array, agent x positions
+                agent_ys: (N,) int array, agent y positions
+                coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
+                action_indices: (N,) int array, action indices (0-6)
+                
+            Returns:
+                (N, embedding_dim) float32 array of embeddings
+            """
+            # Encode agent IDs to colors: 0 -> 0 (red), 1 -> 1 (green)
+            color_indices = agent_ids
+            
+            # Clamp indices to valid ranges for safe indexing
+            color_indices = jnp.clip(color_indices, 0, 1)
+            x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
+            y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
+            coin_indices = jnp.clip(coin_color_indices, 0, 2)
+            action_indices_clipped = jnp.clip(action_indices, 0, 6)
+            
+            # Vectorized lookup: comm_embedding_table[color_indices, x_indices, y_indices, coin_indices, action_indices_clipped]
+            embeddings = comm_embedding_table_jax[
+                color_indices,
+                x_indices,
+                y_indices,
+                coin_indices,
+                action_indices_clipped
+            ]  # Shape: (N, comm_target_dim)
+            
+            return embeddings
+        
+        def lookup_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices, query_type='belief'):
+            """
+            Wrapper function for JAX-accelerated parallel embedding lookup.
+            
+            Args:
+                agent_ids: (N,) int array, agent IDs (0=red, 1=green)
+                agent_xs: (N,) int array, agent x positions
+                agent_ys: (N,) int array, agent y positions
+                coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
+                action_indices: (N,) int array, action indices (0-6)
+                query_type: str, 'belief' or 'communication'
+                
+            Returns:
+                (N, target_dim) float32 array of embeddings (belief_target_dim for belief, comm_target_dim for comm)
+            """
+            if query_type == 'belief':
+                return lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices)
+            else:
+                return lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices)
+        
+        # Keep old query function for backward compatibility (non-jitted, single query)
+        def query_dataset(agent_id, agent_x, agent_y, closest_coin_color, action_idx, 
+                         query_type='belief'):
+            """
+            Query dataset for belief or communication embedding (single query, non-jitted).
+            For batch queries, use lookup_embeddings_jax instead.
+            """
+            key_vector = construct_semantic_key_vector(
+                agent_id, agent_x, agent_y, closest_coin_color, action_idx
+            )
+            
+            entry = dataset.get(key_vector, None)
+            
+            # Get target dimensions from config
+            belief_target_dim = config.get("HIDDEN_DIM", 128)
+            comm_target_dim = config.get("COMM_DIM", 64)
+            
+            if entry is None:
+                if query_type == 'belief':
+                    return jnp.zeros(belief_target_dim, dtype=jnp.float32)
+                else:
+                    return jnp.zeros(comm_target_dim, dtype=jnp.float32)
+            
+            if query_type == 'belief':
+                embedding = entry.get('belief_embedding', None)
+                target_dim = belief_target_dim
+            elif query_type == 'communication':
+                embedding = entry.get('communication_embedding', None)
+                target_dim = comm_target_dim
+            else:
+                return jnp.zeros(comm_target_dim, dtype=jnp.float32)
+            
+            if embedding is None:
+                return jnp.zeros(target_dim, dtype=jnp.float32)
+            
+            # Truncate embedding to target dimension
+            embedding_array = np.array(embedding, dtype=np.float32)
+            if embedding_array.shape[0] >= target_dim:
+                embedding_truncated = embedding_array[:target_dim]
+            else:
+                # Pad with zeros if shorter than target
+                embedding_truncated = np.pad(embedding_array, (0, target_dim - embedding_array.shape[0]),
+                                             mode='constant')
+            
+            # Normalize after truncation
+            embedding_truncated = normalize_l2(embedding_truncated)
+            
+            return jnp.array(embedding_truncated, dtype=jnp.float32)
+        
+        return {
+            'dataset': dataset,  # Keep original for reference
+            'query': query_dataset,  # Keep for backward compatibility
+            'lookup_jax': lookup_embeddings_jax,  # New JAX-accelerated lookup
+            'construct_key': construct_semantic_key_vector,
+            'embedding_dim': embedding_dim,  # Original stored dimension
+            'belief_target_dim': belief_target_dim,  # Truncated dimension for belief
+            'comm_target_dim': comm_target_dim,  # Truncated dimension for communication
+            'size': len(dataset),
+            'grid_size': (grid_size_row, grid_size_col)
+        }
+        
+    except Exception as e:
+        print(f"Error loading LLM dataset from {data_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def compute_social_influence_reward(belief_states, comm_logits, counterfactuals, 
@@ -921,6 +1322,18 @@ def make_train_comm(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    
+    # Load LLM dataset if needed
+    llm_dataset = None
+    if config.get("SUPERVISED_BELIEF", "none") == "llm" or config.get("SUPERVISED_COMM", "none") == "llm":
+        llm_data_path = config.get("LLM_DATA_PATH", "")
+        if llm_data_path:
+            llm_dataset = load_offline_llm_dataset(llm_data_path, config["ENV_NAME"], config)
+            if llm_dataset is None:
+                print("Warning: Failed to load LLM dataset. Supervised learning from LLM will be disabled.")
+        else:
+            print("Warning: LLM_DATA_PATH not set. Supervised learning from LLM will be disabled.")
+    config["LLM_DATASET"] = llm_dataset  # Store in config for access during training
     
     env = LogWrapper(env, replace_info=False)
     
@@ -1266,6 +1679,35 @@ def make_train_comm(config):
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
                 
+                # Extract semantic key information (agent positions and closest coin colors)
+                # env_state is wrapped by LogWrapper, so access inner state via env_state.env_state
+                # env_state.env_state.agent_locs has shape (num_envs, num_agents, 3) where last dim is [x, y, direction]
+                actual_env_state = env_state.env_state  # Unwrap LogWrapper state
+                agent_locs = actual_env_state.agent_locs  # (num_envs, num_agents, 3)
+                grid = actual_env_state.grid  # (num_envs, H, W)
+                
+                # Extract positions: (num_envs, num_agents, 2) -> (num_envs * num_agents, 2)
+                agent_positions = agent_locs[:, :, :2]  # (num_envs, num_agents, 2)
+                agent_positions_flat = agent_positions.reshape(-1, 2)  # (num_envs * num_agents, 2)
+                
+                # Extract directions
+                agent_directions = agent_locs[:, :, 2]  # (num_envs, num_agents)
+                
+                # Find closest coin for each agent using vmap
+                def find_coin_for_agent(agent_x, agent_y, agent_dir, grid_single):
+                    return find_closest_coin_in_fov_jax(
+                        agent_x, agent_y, agent_dir, grid_single
+                    )
+                
+                # Vectorize over environments and agents
+                # Reshape for vmap: (num_envs, num_agents, ...)
+                closest_coin_colors = jax.vmap(
+                    jax.vmap(find_coin_for_agent, in_axes=(0, 0, 0, None)), 
+                    in_axes=(0, 0, 0, 0)
+                )(agent_positions[:, :, 0], agent_positions[:, :, 1], agent_directions, grid)
+                # Result: (num_envs, num_agents)
+                closest_coin_colors_flat = closest_coin_colors.reshape(-1)  # (num_envs * num_agents,)
+                
                 # Store transition
                 if config.get("PARAMETER_SHARING", True):
                     # PARAMETER SHARING: rewards are flattened (num_envs * num_agents,)
@@ -1309,6 +1751,8 @@ def make_train_comm(config):
                         tom_pred_for_storage,  # Store ToM predictions (or zeros if disabled)
                         prev_comm_batch,  # Store received/aggregated communication that was used as input
                         info,
+                        agent_positions_flat,  # Store agent positions for semantic key
+                        closest_coin_colors_flat,  # Store closest coin colors for semantic key
                     )
                 else:
                     # NON-PARAMETER SHARING: rewards are per-agent (num_envs,) for each agent
@@ -1335,6 +1779,10 @@ def make_train_comm(config):
                         else:
                             agent_tom_pred = jnp.zeros_like(agent_belief)
                         
+                        # Extract agent positions and coin colors for this agent
+                        agent_i_positions = agent_positions_flat[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]]
+                        agent_i_coin_colors = closest_coin_colors_flat[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]]
+                        
                         transition.append(TransitionComm(
                             done_list[i],
                             env_act[i],
@@ -1351,6 +1799,8 @@ def make_train_comm(config):
                             agent_tom_pred,  # Store ToM predictions (or zeros if disabled)
                             prev_comm_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],  # Store received/aggregated communication that was used as input
                             info_i,
+                            agent_i_positions,  # Store agent positions for semantic key
+                            agent_i_coin_colors,  # Store closest coin colors for semantic key
                         ))
                 
                 runner_state = (train_state, env_state, obsv, new_hidden_reshaped, aggregated_comm, update_step, rng)
@@ -1585,12 +2035,13 @@ def make_train_comm(config):
                         # Loss for comm: negative advantage-weighted entropy (encourages high-reward comms)
                         loss_comm = -comm_gae_normalized.mean() * comm_entropy
                         
-                        # SUPERVISED LEARNING LOSS (when ToM is enabled)
+                        # SUPERVISED LEARNING LOSS
                         # Uses cosine similarity loss for both belief and communication supervision
                         supervised_loss = 0.0
+                        
+                        # Supervised belief loss (requires USE_TOM = True)
                         if config.get("USE_TOM", False):
                             supervised_belief = config.get("SUPERVISED_BELIEF", "none")
-                            supervised_comm = config.get("SUPERVISED_COMM", "none")
                             
                             # Supervised belief loss (using cosine similarity)
                             if supervised_belief == "ground_truth" and tom_pred_recomputed is not None:
@@ -1627,38 +2078,124 @@ def make_train_comm(config):
                                 supervised_loss += jnp.mean(masked_belief_loss) * config.get("SUPERVISED_LOSS_COEF", 0.1)
                             
                             elif supervised_belief == "llm":
-                                # LLM dataset supervision (UNDER CONSTRUCTION)
-                                # Would load target beliefs from offline LLM dataset and compute cosine similarity
-                                pass
-                            
-                            # Supervised communication loss (using cosine similarity)
-                            if supervised_comm == "ground_truth":
-                                # Supervise communication vectors to be similar across agents
+                                # LLM dataset supervision with JAX-accelerated parallel lookups
+                                llm_dataset = config.get("LLM_DATASET", None)
+                                if llm_dataset is not None and tom_pred_recomputed is not None:
+                                    # Reshape to (num_envs, num_agents, hidden_dim)
+                                    num_envs = batch_size // env.num_agents
+                                    tom_pred_reshaped = tom_pred_recomputed.reshape(num_envs, env.num_agents, hidden_dim)
+                                    
+                                    # Get stored semantic key information
+                                    agent_positions = traj_batch.agent_positions  # (batch_size, 2)
+                                    closest_coin_colors = traj_batch.closest_coin_colors  # (batch_size,)
+                                    actions = traj_batch.action  # (batch_size,)
+                                    
+                                    # Reshape to (num_envs, num_agents, ...)
+                                    agent_positions_reshaped = agent_positions.reshape(num_envs, env.num_agents, 2)
+                                    closest_coin_colors_reshaped = closest_coin_colors.reshape(num_envs, env.num_agents)
+                                    actions_reshaped = actions.reshape(num_envs, env.num_agents)
+                                    
+                                    # Use JAX-accelerated parallel lookup for all agents and environments at once
+                                    # Flatten to (num_envs * num_agents,) for batch lookup
+                                    # agent_ids: for each environment, we have agents 0, 1, ..., num_agents-1
+                                    # So we need: [0, 1, ..., num_agents-1, 0, 1, ..., num_agents-1, ...] (repeated num_envs times)
+                                    agent_ids_flat = jnp.tile(jnp.arange(env.num_agents), num_envs)  # (num_envs * num_agents,)
+                                    agent_xs_flat = agent_positions_reshaped[:, :, 0].flatten()  # (num_envs * num_agents,)
+                                    agent_ys_flat = agent_positions_reshaped[:, :, 1].flatten()  # (num_envs * num_agents,)
+                                    coin_color_indices_flat = closest_coin_colors_reshaped.flatten()  # (num_envs * num_agents,)
+                                    action_indices_flat = actions_reshaped.flatten()  # (num_envs * num_agents,)
+                                    
+                                    # Parallel lookup: all queries processed in one GPU call
+                                    target_beliefs_flat = llm_dataset['lookup_jax'](
+                                        agent_ids=agent_ids_flat,
+                                        agent_xs=agent_xs_flat.astype(jnp.int32),
+                                        agent_ys=agent_ys_flat.astype(jnp.int32),
+                                        coin_color_indices=coin_color_indices_flat.astype(jnp.int32),
+                                        action_indices=action_indices_flat.astype(jnp.int32),
+                                        query_type='belief'
+                                    )  # (num_envs * num_agents, embedding_dim)
+                                    
+                                    # Reshape back to (num_envs, num_agents, embedding_dim)
+                                    target_beliefs = target_beliefs_flat.reshape(num_envs, env.num_agents, -1)
+                                    
+                                    # For ToM: agent i predicts agent j's belief (i != j)
+                                    # Expand to compare each agent's ToM pred with each other agent's target belief
+                                    tom_expanded = jnp.expand_dims(tom_pred_reshaped, 2)  # (num_envs, num_agents, 1, hidden_dim)
+                                    target_expanded = jnp.expand_dims(target_beliefs, 1)  # (num_envs, 1, num_agents, embedding_dim)
+                                    
+                                    # Compute cosine similarity
+                                    dot_product = jnp.sum(tom_expanded * target_expanded, axis=-1)
+                                    tom_norm = jnp.linalg.norm(tom_expanded, axis=-1) + 1e-8
+                                    target_norm = jnp.linalg.norm(target_expanded, axis=-1) + 1e-8
+                                    cos_sim = dot_product / (tom_norm * target_norm)
+                                    
+                                    # Loss = 1 - cosine_similarity
+                                    belief_loss = 1.0 - cos_sim  # (num_envs, num_agents, num_agents)
+                                    
+                                    # Mask out self-prediction (diagonal)
+                                    mask = 1.0 - jnp.eye(env.num_agents)  # (num_agents, num_agents)
+                                    mask = jnp.expand_dims(mask, 0)  # (1, num_agents, num_agents)
+                                    
+                                    masked_belief_loss = belief_loss * mask
+                                    supervised_loss += jnp.mean(masked_belief_loss) * config.get("SUPERVISED_LOSS_COEF", 0.1)
+                                else:
+                                    if llm_dataset is None:
+                                        print("Warning: LLM dataset not available for belief supervision")
+                        
+                        # Supervised communication loss (requires USE_TOM = False)
+                        # Each agent aligns their own communication vector with LLM ground truth
+                        supervised_comm = config.get("SUPERVISED_COMM", "none")
+                        if supervised_comm == "llm":
+                            # LLM dataset supervision for communication with JAX-accelerated parallel lookups
+                            llm_dataset = config.get("LLM_DATASET", None)
+                            if llm_dataset is not None:
+                                num_envs = batch_size // env.num_agents
                                 # Reshape communication vectors: (batch_size, comm_dim) -> (num_envs, num_agents, comm_dim)
                                 comm_reshaped = traj_batch.comm_vector.reshape(num_envs, env.num_agents, comm_dim)
                                 
-                                # Compare each agent's communication with other agents' communications
-                                # This encourages agents to develop similar communication patterns
-                                comm_i = jnp.expand_dims(comm_reshaped, 2)  # (num_envs, num_agents, 1, comm_dim)
-                                comm_j = jnp.expand_dims(comm_reshaped, 1)  # (num_envs, 1, num_agents, comm_dim)
+                                # Get stored semantic key information
+                                agent_positions = traj_batch.agent_positions  # (batch_size, 2)
+                                closest_coin_colors = traj_batch.closest_coin_colors  # (batch_size,)
+                                actions = traj_batch.action  # (batch_size,)
                                 
-                                # Compute cosine similarity between communications
-                                dot_product = jnp.sum(comm_i * comm_j, axis=-1)
-                                comm_i_norm = jnp.linalg.norm(comm_i, axis=-1) + 1e-8
-                                comm_j_norm = jnp.linalg.norm(comm_j, axis=-1) + 1e-8
-                                comm_cos_sim = dot_product / (comm_i_norm * comm_j_norm)
+                                # Reshape to (num_envs, num_agents, ...)
+                                agent_positions_reshaped = agent_positions.reshape(num_envs, env.num_agents, 2)
+                                closest_coin_colors_reshaped = closest_coin_colors.reshape(num_envs, env.num_agents)
+                                actions_reshaped = actions.reshape(num_envs, env.num_agents)
                                 
-                                # Loss = 1 - cosine_similarity (encourage similar communications)
-                                comm_loss_matrix = 1.0 - comm_cos_sim  # (num_envs, num_agents, num_agents)
+                                # Use JAX-accelerated parallel lookup for all agents and environments at once
+                                # Flatten to (num_envs * num_agents,) for batch lookup
+                                agent_ids_flat = jnp.tile(jnp.arange(env.num_agents), num_envs)  # (num_envs * num_agents,)
+                                agent_xs_flat = agent_positions_reshaped[:, :, 0].flatten()  # (num_envs * num_agents,)
+                                agent_ys_flat = agent_positions_reshaped[:, :, 1].flatten()  # (num_envs * num_agents,)
+                                coin_color_indices_flat = closest_coin_colors_reshaped.flatten()  # (num_envs * num_agents,)
+                                action_indices_flat = actions_reshaped.flatten()  # (num_envs * num_agents,)
                                 
-                                # Mask out self-comparison (diagonal)
-                                comm_loss_masked = comm_loss_matrix * mask
-                                supervised_loss += jnp.mean(comm_loss_masked) * config.get("SUPERVISED_LOSS_COEF", 0.1)
-                            
-                            elif supervised_comm == "llm":
-                                # LLM dataset supervision for communication
-                                # Would compare communication vectors with LLM-generated communication embeddings
-                                pass
+                                # Parallel lookup: all queries processed in one GPU call
+                                target_comms_flat = llm_dataset['lookup_jax'](
+                                    agent_ids=agent_ids_flat,
+                                    agent_xs=agent_xs_flat.astype(jnp.int32),
+                                    agent_ys=agent_ys_flat.astype(jnp.int32),
+                                    coin_color_indices=coin_color_indices_flat.astype(jnp.int32),
+                                    action_indices=action_indices_flat.astype(jnp.int32),
+                                    query_type='communication'
+                                )  # (num_envs * num_agents, embedding_dim)
+                                
+                                # Reshape back to (num_envs, num_agents, embedding_dim)
+                                target_comms = target_comms_flat.reshape(num_envs, env.num_agents, -1)
+                                
+                                # Compute cosine similarity between predicted and target communications
+                                # Each agent aligns their own communication with LLM ground truth
+                                dot_product = jnp.sum(comm_reshaped * target_comms, axis=-1)
+                                comm_norm = jnp.linalg.norm(comm_reshaped, axis=-1) + 1e-8
+                                target_norm = jnp.linalg.norm(target_comms, axis=-1) + 1e-8
+                                comm_cos_sim = dot_product / (comm_norm * target_norm)
+                                
+                                # Loss = 1 - cosine_similarity
+                                comm_loss = 1.0 - comm_cos_sim  # (num_envs, num_agents)
+                                supervised_loss += jnp.mean(comm_loss) * config.get("SUPERVISED_LOSS_COEF", 0.1)
+                            else:
+                                print("Warning: LLM dataset not available for communication supervision")
                         
                         total_loss = (
                             loss_actor
@@ -1852,6 +2389,18 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+
+    # Load LLM dataset if needed
+    llm_dataset = None
+    if config.get("SUPERVISED_BELIEF", "none") == "llm" or config.get("SUPERVISED_COMM", "none") == "llm":
+        llm_data_path = config.get("LLM_DATA_PATH", "")
+        if llm_data_path:
+            llm_dataset = load_offline_llm_dataset(llm_data_path, config["ENV_NAME"], config)
+            if llm_dataset is None:
+                print("Warning: Failed to load LLM dataset. Supervised learning from LLM will be disabled.")
+        else:
+            print("Warning: LLM_DATA_PATH not set. Supervised learning from LLM will be disabled.")
+    config["LLM_DATASET"] = llm_dataset  # Store in config for access during training
 
     env = LogWrapper(env, replace_info=False)
 
@@ -2523,33 +3072,33 @@ def evaluate(params, env, save_path, config):
 
 def tune(default_config):
     """
-    Hyperparameter sweep with wandb for coefficient experiments.
+    Hyperparameter sweep with wandb for LLM supervision experiments.
     
-    Sweeps over:
-    - SUPERVISED_LOSS_COEF: [0.1, 1.0]
-    - COMM_LOSS_COEF: [0.1, 1.0]
-    - SOCIAL_INFLUENCE_COEFF: [0.1, 1.0]
+    Sweeps over two configurations:
+    1. ToM supervised on LLM beliefs + Intrinsic reward
+       - USE_TOM: True (required for belief supervision)
+       - SUPERVISED_BELIEF: "llm"
+       - SUPERVISED_COMM: "none"
+       - USE_INTRINSIC_REWARD: True
+       - SOCIAL_INFLUENCE_COEFF: 0.1
+    2. Communication supervised on LLM communication + No Intrinsic reward
+       - USE_TOM: False (required for communication supervision)
+       - SUPERVISED_COMM: "llm"
+       - SUPERVISED_BELIEF: "none"
+       - USE_INTRINSIC_REWARD: False
+       - SOCIAL_INFLUENCE_COEFF: 0.0
     
-    Total combinations: 2 × 2 × 2 = 8 runs
+    Note: Supervised communication requires USE_TOM = False because each agent
+    aligns their own communication vector with LLM ground truth independently.
     
-    Fixed settings:
-    - USE_TOM: True (enabled for supervised loss)
-    - USE_INTRINSIC_REWARD: True (enabled for social influence)
-    - USE_COMM: True (communication enabled)
-    - PARAMETER_SHARING: True (parameter sharing enabled)
-    - SUPERVISED_BELIEF: "ground_truth" (supervised learning enabled)
-    - USE_SEPARATE_REWARDS: True (separate rewards for action and comm)
-    - INFLUENCE_TARGET: "belief" (belief-based influence)
+    Total runs: 2 configurations
     """
     import copy
 
     default_config = OmegaConf.to_container(default_config)
 
-    # Define coefficient values to sweep over [0.1, 1]
-    coefficient_values = [0.1, 1.0]
-
     sweep_config = {
-        "name": "lgtom_coefficient_sweep",
+        "name": "lgtom_llm_supervision_sweep",
         "method": "grid",  # Try all combinations
         "program": "lgtom_cnn_coins.py",  # The script to run
         "metric": {
@@ -2557,23 +3106,21 @@ def tune(default_config):
             "goal": "maximize",
         },
         "parameters": {
-            # Main sweep parameters: coefficient values
-            "SUPERVISED_LOSS_COEF": {"values": coefficient_values},
-            "COMM_LOSS_COEF": {"values": coefficient_values},
-            "SOCIAL_INFLUENCE_COEFF": {"values": coefficient_values},
+            # Configuration selector: "tom_llm_intrinsic" or "comm_llm_no_intrinsic"
+            "CONFIG_TYPE": {
+                "values": ["tom_llm_intrinsic", "comm_llm_no_intrinsic"]
+            },
             
             # Fixed parameters
-            "USE_TOM": {"values": [True]},  # Enable ToM for supervised loss
-            "USE_INTRINSIC_REWARD": {"values": [True]},  # Enable intrinsic reward
+            # "USE_TOM": {"values": [True]},  # Enable ToM (needed for both configs)
             "USE_COMM": {"values": [True]},  # Always use communication
             "PARAMETER_SHARING": {"values": [False]},  # Parameter sharing enabled
-            "SUPERVISED_BELIEF": {"values": ["ground_truth"]},  # Supervised learning enabled
-            "USE_SEPARATE_REWARDS": {"values": [False]},  # Separate rewards
+            "USE_SEPARATE_REWARDS": {"values": [False]},  # Separate rewards for action and comm
             "INFLUENCE_TARGET": {"values": ["belief"]},  # Belief-based influence
-            "SEED": {"values": [42]},  # Single seed for sweep (can be extended)
+            "SEED": {"values": [110]},  # Single seed for sweep (can be extended)
             "ENV_KWARGS.shared_rewards": {"values": [False]},  # Individual rewards
-            
-            # Total runs: 2 × 2 × 2 = 8 experiments
+            "SUPERVISED_LOSS_COEF": {"values": [0.1]},  # Fixed coefficient for supervised loss
+            "COMM_LOSS_COEF": {"values": [0.1]},  # Fixed coefficient for comm loss
         },
     }
 
@@ -2592,58 +3139,70 @@ def tune(default_config):
             else:
                 config[k] = v
         
-        # Get sweep parameters (coefficients are set directly from wandb.config)
-        supervised_coef = config.get("SUPERVISED_LOSS_COEF", 1.0)
-        comm_coef = config.get("COMM_LOSS_COEF", 1.0)
-        social_influence_coef = config.get("SOCIAL_INFLUENCE_COEFF", 0.1)
+        # Get configuration type
+        config_type = config.get("CONFIG_TYPE", "tom_llm_intrinsic")
         
-        # Ensure coefficients are set correctly
-        config["SUPERVISED_LOSS_COEF"] = supervised_coef
-        config["COMM_LOSS_COEF"] = comm_coef
-        config["SOCIAL_INFLUENCE_COEFF"] = social_influence_coef
+        # Set configuration based on type
+        if config_type == "tom_llm_intrinsic":
+            # Configuration 1: ToM supervised on LLM beliefs + Intrinsic reward
+            config["USE_TOM"] = True
+            config["SUPERVISED_BELIEF"] = "llm"
+            config["SUPERVISED_COMM"] = "none"
+            config["USE_INTRINSIC_REWARD"] = True
+            config["SOCIAL_INFLUENCE_COEFF"] = 0.1
+            config_name = "ToM_LLM_Beliefs_Intrinsic"
+            tags = ["LGTOM", "COMM", "PS", "LLM_BELIEF", "INTRINSIC", "TOM_SUPERVISED"]
+        elif config_type == "comm_llm_no_intrinsic":
+            # Configuration 2: Communication supervised on LLM communication + No Intrinsic reward
+            config["USE_TOM"] = False
+            config["SUPERVISED_COMM"] = "llm"
+            config["SUPERVISED_BELIEF"] = "none"
+            config["USE_INTRINSIC_REWARD"] = False
+            config["SOCIAL_INFLUENCE_COEFF"] = 0.0
+            config_name = "Comm_LLM_NoIntrinsic"
+            tags = ["LGTOM", "COMM", "PS", "LLM_COMM", "NO_INTRINSIC", "COMM_SUPERVISED"]
+        else:
+            raise ValueError(f"Unknown CONFIG_TYPE: {config_type}")
         
         # Ensure fixed settings
-        config["USE_COMM"] = True
-        config["USE_TOM"] = True
-        config["USE_INTRINSIC_REWARD"] = True
-        config["PARAMETER_SHARING"] = False
-        config["SUPERVISED_BELIEF"] = "ground_truth"
-        config["USE_SEPARATE_REWARDS"] = False
-        config["INFLUENCE_TARGET"] = "belief"
+        # config["USE_COMM"] = True
+        # config["USE_TOM"] = True
+        # config["PARAMETER_SHARING"] = True
+        # config["USE_SEPARATE_REWARDS"] = True
+        # config["INFLUENCE_TARGET"] = "belief"
         
-        # Build descriptive run name with coefficient values
-        run_name = (f"lgtom_coef_sup{supervised_coef}_comm{comm_coef}_"
-                   f"inf{social_influence_coef}_s{config['SEED']}")
+        # Ensure LLM dataset path is set (required for LLM supervision)
+        if not config.get("LLM_DATA_PATH", ""):
+            print("Warning: LLM_DATA_PATH not set. LLM supervision will be disabled.")
+        
+        # Build descriptive run name
+        run_name = f"{config_name}_s{config['SEED']}"
         wandb.run.name = run_name
-        
-        # Update tags based on configuration
-        tags = ["LGTOM", "COMM", "IND", "BELIEF", "COEFFICIENT_SWEEP", "JOINT_REWARDS"]
-        tags.append("TOM")
-        tags.append("INTRINSIC")
-        tags.append(f"SUP_COEF_{supervised_coef}")
-        tags.append(f"COMM_COEF_{comm_coef}")
-        tags.append(f"INF_COEF_{social_influence_coef}")
         
         wandb.run.tags = tags
         
-        # Log coefficient values to wandb config for easy filtering
+        # Log configuration to wandb config
         wandb.config.update({
-            "SUPERVISED_LOSS_COEF": supervised_coef,
-            "COMM_LOSS_COEF": comm_coef,
-            "SOCIAL_INFLUENCE_COEFF": social_influence_coef,
+            "CONFIG_TYPE": config_type,
+            "USE_TOM": config.get("USE_TOM", False),
+            "SUPERVISED_BELIEF": config.get("SUPERVISED_BELIEF", "none"),
+            "SUPERVISED_COMM": config.get("SUPERVISED_COMM", "none"),
+            "USE_INTRINSIC_REWARD": config.get("USE_INTRINSIC_REWARD", False),
+            "SOCIAL_INFLUENCE_COEFF": config.get("SOCIAL_INFLUENCE_COEFF", 0.0),
         })
         
         print("="*70)
-        print(f"Running coefficient sweep experiment: {run_name}")
-        print(f"  SUPERVISED_LOSS_COEF: {supervised_coef}")
-        print(f"  COMM_LOSS_COEF: {comm_coef}")
-        print(f"  SOCIAL_INFLUENCE_COEFF: {social_influence_coef}")
-        print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', True)}")
+        print(f"Running LLM supervision sweep experiment: {run_name}")
+        print(f"  Configuration: {config_type}")
+        print(f"  USE_TOM: {config.get('USE_TOM', False)}")
+        print(f"  SUPERVISED_BELIEF: {config.get('SUPERVISED_BELIEF', 'none')}")
+        print(f"  SUPERVISED_COMM: {config.get('SUPERVISED_COMM', 'none')}")
+        print(f"  USE_INTRINSIC_REWARD: {config.get('USE_INTRINSIC_REWARD', False)}")
+        print(f"  SOCIAL_INFLUENCE_COEFF: {config.get('SOCIAL_INFLUENCE_COEFF', 0.0)}")
+        print(f"  PARAMETER_SHARING: {config.get('PARAMETER_SHARING', False)}")
         print(f"  USE_SEPARATE_REWARDS: {config.get('USE_SEPARATE_REWARDS', True)}")
         print(f"  INFLUENCE_TARGET: {config.get('INFLUENCE_TARGET', 'belief')}")
-        print(f"  USE_INTRINSIC_REWARD: {config.get('USE_INTRINSIC_REWARD', True)}")
-        print(f"  USE_TOM: {config.get('USE_TOM', True)}")
-        print(f"  SUPERVISED_BELIEF: {config.get('SUPERVISED_BELIEF', 'ground_truth')}")
+        print(f"  LLM_DATA_PATH: {config.get('LLM_DATA_PATH', 'Not set')}")
         print(f"  SEED: {config['SEED']}")
         print(f"  Total Timesteps: {config['TOTAL_TIMESTEPS']:.0e}")
         print(f"  Tags: {tags}")
@@ -2664,7 +3223,7 @@ def tune(default_config):
         
         # Optional: Save checkpoint and evaluate
         # Uncomment if you want to save models during sweep
-        # filename = f"{config['ENV_NAME']}_{param_sharing_str}_{reward_str}_seed{config['SEED']}"
+        # filename = f"{config['ENV_NAME']}_{config_type}_seed{config['SEED']}"
         # if config.get("PARAMETER_SHARING", True):
         #     save_path = f"./checkpoints/sweep/{filename}.pkl"
         #     save_params(train_state, save_path)
@@ -2678,35 +3237,38 @@ def tune(default_config):
         sweep_config, entity=default_config["ENTITY"], project=default_config["PROJECT"]
     )
     
-    num_coef_values = len(coefficient_values)
-    total_runs = num_coef_values ** 3
+    total_runs = 2  # Two configurations
     
     print("\n" + "="*70)
-    print("Starting WandB Sweep: Coefficient Hyperparameter Sweep")
+    print("Starting WandB Sweep: LLM Supervision Experiments")
     print(f"Sweep ID: {sweep_id}")
-    print(f"Total Combinations:")
-    print(f"  - SUPERVISED_LOSS_COEF: {num_coef_values} values {coefficient_values}")
-    print(f"  - COMM_LOSS_COEF: {num_coef_values} values {coefficient_values}")
-    print(f"  - SOCIAL_INFLUENCE_COEFF: {num_coef_values} values {coefficient_values}")
-    print(f"  - Total runs: {total_runs} ({num_coef_values}³)")
-    print(f"Timesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
+    print(f"Total Configurations: {total_runs}")
+    print(f"\nConfiguration 1: ToM supervised on LLM beliefs + Intrinsic reward")
+    print(f"  - USE_TOM: True (required for belief supervision)")
+    print(f"  - SUPERVISED_BELIEF: 'llm'")
+    print(f"  - SUPERVISED_COMM: 'none'")
+    print(f"  - USE_INTRINSIC_REWARD: True")
+    print(f"  - SOCIAL_INFLUENCE_COEFF: 0.1")
+    print(f"\nConfiguration 2: Communication supervised on LLM communication + No Intrinsic reward")
+    print(f"  - USE_TOM: False (required for communication supervision)")
+    print(f"  - SUPERVISED_COMM: 'llm'")
+    print(f"  - SUPERVISED_BELIEF: 'none'")
+    print(f"  - USE_INTRINSIC_REWARD: False")
+    print(f"  - SOCIAL_INFLUENCE_COEFF: 0.0")
     print(f"\nFixed Settings:")
-    print(f"  - USE_TOM: True (enabled for supervised loss)")
-    print(f"  - USE_INTRINSIC_REWARD: True (enabled for social influence)")
     print(f"  - USE_COMM: True (communication enabled)")
-    print(f"  - PARAMETER_SHARING: True (parameter sharing enabled)")
-    print(f"  - SUPERVISED_BELIEF: 'ground_truth' (supervised learning enabled)")
+    print(f"  - PARAMETER_SHARING: False (independent agents)")
     print(f"  - USE_SEPARATE_REWARDS: True (separate rewards for action and comm)")
     print(f"  - INFLUENCE_TARGET: 'belief' (belief-based influence)")
+    print(f"  - SUPERVISED_LOSS_COEF: 0.1")
+    print(f"  - COMM_LOSS_COEF: 0.1")
     print(f"  - SEED: {default_config.get('SEED', 42)}")
     print(f"  - Individual rewards (not shared)")
-    print(f"\nSweep Parameters:")
-    print(f"  - Coefficient range: [0.1, 1.0]")
-    print(f"  - Coefficient values: {coefficient_values}")
-    print(f"  - All coefficients will be logged to WandB for analysis")
+    print(f"\nTimesteps per run: {default_config['TOTAL_TIMESTEPS']:.0e}")
+    print(f"Total runs: {total_runs}")
     print("="*70 + "\n")
     
-    # Run sweep agent for all combinations
+    # Run sweep agent for all configurations
     wandb.agent(sweep_id, wrapped_make_train, count=total_runs)
 
 

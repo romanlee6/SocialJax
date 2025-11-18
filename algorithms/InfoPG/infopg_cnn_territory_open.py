@@ -1,5 +1,5 @@
 """ 
-InfoPG (Adv InfoPG with k=1) Implementation for Coin Game
+InfoPG (Adv InfoPG with k=1) Implementation for Territory Environment
 Based on InfoPG paper and adapted from IPPO implementation
 """
 import sys
@@ -296,7 +296,7 @@ def make_train(config):
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
 
-                # For coin game, we use non-parameter sharing (PARAMETER_SHARING: False)
+                # For territory environment, we use non-parameter sharing (PARAMETER_SHARING: False)
                 # Each agent has its own network
                 obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))  # [num_agents, num_envs, *obs_shape]
                 env_act = {}
@@ -579,8 +579,6 @@ def make_train(config):
             
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            if "eat_own_coins" in metric:
-                metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
             jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, prev_latents_state, update_step, rng)
@@ -618,7 +616,7 @@ def single_run(config):
         tags=["InfoPG", "Adv-InfoPG", "k=1"] + config.get("WANDB_TAGS", []),
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'infopg_cnn_coins_k{config.get("K_LEVELS", 1)}'
+        name=f'infopg_cnn_territory_k{config.get("K_LEVELS", 1)}'
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -640,10 +638,11 @@ def single_run(config):
     print("** Training Complete **")
 
 
-@hydra.main(version_base=None, config_path="config", config_name="infopg_cnn_coins")
+@hydra.main(version_base=None, config_path="config", config_name="infopg_cnn_territory_open")
 def main(config):
     single_run(config)
 
 if __name__ == "__main__":
     main()
+
 

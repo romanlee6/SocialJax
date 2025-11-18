@@ -1,0 +1,49 @@
+"LR": 0.0005
+"NUM_ENVS": 225
+"NUM_STEPS": 999  # Changed from 1000 to ensure MINIBATCH_SIZE is divisible by num_agents (9) when PARAMETER_SHARING=False
+                   # With NUM_MINIBATCHES=225: MINIBATCH_SIZE = (225 * 999) / 225 = 999, which is divisible by 9 ✓
+"TOTAL_TIMESTEPS": 1e7  # Each sweep run will train for 1M timesteps
+"UPDATE_EPOCHS": 2
+"NUM_MINIBATCHES": 225  # Must evenly divide NUM_ACTORS * NUM_STEPS; MINIBATCH_SIZE must be divisible by num_agents (9) when needed
+                        # When PARAMETER_SHARING=False: NUM_ACTORS = 225, MINIBATCH_SIZE = (225 * 999) / 225 = 999, divisible by 9 ✓
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"ENT_COEF": 0.01
+"VF_COEF": 0.5
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ENV_NAME": "territory_open"
+"REW_SHAPING_HORIZON": 2.5e6 # for how many timesteps add a shaping reward
+"SHAPING_BEGIN": 1e6
+"ENV_KWARGS": 
+  "num_agents" : 9
+  "num_inner_steps" : 999
+  "shared_rewards" : False # Attention: switch to False for individual rewards 
+  "cnn" : True
+  "jit" : True
+  
+"ANNEAL_LR": True
+"SEED": 42
+"NUM_SEEDS": 1
+"TUNE": True
+
+"REWARD": "individual" # individual; common
+"GIF_NUM_FRAMES": 250
+"PARAMETER_SHARING": False
+
+# InfoPG specific parameters
+"K_LEVELS": 1 # Number of k-levels for recursive communication
+"LATENT_SIZE": 64 # Size of latent policy vector
+"COMMUNICATION_RANGE": 1.0 # Communication range for adjacency graph (not used for territory as all agents communicate)
+
+# WandB Params
+"ENTITY": ""
+"PROJECT": "socialjax"
+"WANDB_MODE" : "online"
+"WANDB_TAGS":
+  - INDIVIDUAL_REWARD # COMMON_REWARD
+  - INFOPG
+  - TERRITORY
+
+

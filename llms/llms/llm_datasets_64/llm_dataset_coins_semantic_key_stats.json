@@ -1,0 +1,8 @@
+{
+  "total_entries": 2200,
+  "unique_keys": 1224,
+  "total_trajectory_files": 11,
+  "embedding_dim": 64,
+  "game_type": "coins",
+  "filter_prefix": "gpt-5.1"
+}
