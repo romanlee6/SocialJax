@@ -1505,7 +1505,7 @@ if __name__ == "__main__":
         )
     else:
         # Multiple runs with different seeds
-        seeds = list(range(1, 1 + args.num_runs))
+        seeds = list(range(10, 10 + args.num_runs))
         for i, seed in enumerate(seeds):
             print(f"\n{'='*70}")
             print(f"Run {i+1}/{args.num_runs} with seed {seed}")

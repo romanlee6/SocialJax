@@ -244,7 +244,10 @@ class ActorCriticComm(nn.Module):
                 bias_init=constant(0.0),
                 name='tom_predictor'
             )(belief_input)
-            tom_pred = activation(tom_pred)
+            # Keep outputs in the same [-1, 1] range as the belief GRU so the
+            # cosine-similarity supervised loss can decrease.
+            # tom_activation = nn.tanh
+            # tom_pred = tom_activation(tom_pred)
         
         # 5. Communication Policy (using prototype layer)
         proto_layer = ProtoLayer(num_protos=self.num_protos, comm_dim=self.comm_dim)
@@ -1581,9 +1584,10 @@ def make_train_comm(config):
                         # So we use a simple policy gradient: maximize log_prob * advantage
                         # Use the stored comm_log_prob (which is actually entropy in the current implementation)
                         # For now, we'll use entropy bonus to encourage exploration in comm
-                        comm_entropy = comm_pi.entropy().mean()
+                        comm_entropy = comm_pi.entropy()
+                        comm_entropy_mean = comm_entropy.mean()
                         # Loss for comm: negative advantage-weighted entropy (encourages high-reward comms)
-                        loss_comm = -comm_gae_normalized.mean() * comm_entropy
+                        loss_comm = -(comm_gae_normalized * comm_entropy).mean()
                         
                         # SUPERVISED LEARNING LOSS (when ToM is enabled)
                         # Uses cosine similarity loss for both belief and communication supervision
@@ -1667,7 +1671,7 @@ def make_train_comm(config):
                             - config["ENT_COEF"] * entropy
                             + supervised_loss  # Add supervised learning loss
                         )
-                        return total_loss, (value_loss, loss_actor, loss_comm, entropy, comm_entropy, supervised_loss)
+                        return total_loss, (value_loss, loss_actor, loss_comm, entropy, comm_entropy_mean, supervised_loss)
                     
                     rng, _rng = jax.random.split(update_state[-1])
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)

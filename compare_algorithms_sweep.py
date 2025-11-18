@@ -1,32 +1,23 @@
 """
-Unified WandB Sweep Script to Compare LG-TOM variants, InfoPG, and AutoEncoder
+Unified WandB sweep script to compare LG-TOM variants, InfoPG, and AutoEncoder
 on Coin Game with consistent hyperparameters.
 
 Usage:
     python compare_algorithms_sweep.py
 
-This will create a WandB sweep with 6 experiments × 5 seeds = 30 total runs:
-1. Social Influence: use_ToM, ground_truth_supervision, use intrinsic
-2. LG-ToM: use_ToM, llm_supervision, use intrinsic
-3. LangGround: no_ToM, llm_supervision on communication, no intrinsic
-4. Proto: no_ToM, no intrinsic
-5. AutoEncoder: AUTOENCODER_LOSS_COEF=1
-6. InfoPG: k=1
+Running this file now launches two WandB sweeps:
 
-Common Settings:
-- Individual rewards (shared_rewards=False)
-- No parameter sharing (PARAMETER_SHARING=False)
-- Joint rewards (USE_SEPARATE_REWARDS=False)
-- Influence target=belief
-- Seeds: [1, 2, 3, 4, 5] (swept over)
-- Total timesteps: 1e8
-- NUM_ENVS: 512 (unified across all methods)
-- Communication enabled (USE_COMM=True)
+1. LG-TOM Variants (Default Settings)
+   - Experiments: Social Influence, LG-ToM, LangGround, Proto
+   - Seeds: [1, 2, 3]
+   - Individual rewards (shared_rewards=False), no parameter sharing,
+     joint reward heads.
 
-When available:
-- comm loss coef = 1
-- intrinsic coef = 1 (SOCIAL_INFLUENCE_COEFF=1)
-- supervised coefficient = 0.1 (SUPERVISED_LOSS_COEF=0.1)
+2. All Methods (Shared Setup)
+   - Experiments: Social Influence, LG-ToM, LangGround, Proto, AutoEncoder, InfoPG
+   - Seeds: [1, 2, 3]
+   - Shared rewards (shared_rewards=True), parameter sharing enabled,
+     separate reward heads (USE_SEPARATE_REWARDS=True).
 """
 import sys
 import os
@@ -256,6 +247,10 @@ def wrapped_make_train():
     
     # Override seed with sweep parameter
     unified_config["SEED"] = seed
+    config_get = lambda key, default: getattr(wandb.config, key, default)
+    shared_rewards = config_get("shared_rewards", unified_config["ENV_KWARGS"].get("shared_rewards", False))
+    parameter_sharing = config_get("PARAMETER_SHARING", unified_config.get("PARAMETER_SHARING", False))
+    use_separate_rewards = config_get("USE_SEPARATE_REWARDS", unified_config.get("USE_SEPARATE_REWARDS", False))
     
     # Merge with algorithm-specific defaults
     for key, value in base_config.items():
@@ -264,6 +259,10 @@ def wrapped_make_train():
                 unified_config[key].update(value)
             else:
                 unified_config[key] = value
+    
+    unified_config["ENV_KWARGS"]["shared_rewards"] = shared_rewards
+    unified_config["PARAMETER_SHARING"] = parameter_sharing
+    unified_config["USE_SEPARATE_REWARDS"] = use_separate_rewards
     
     # Apply algorithm-specific configuration
     experiment_name = experiment.get("name", variant or algorithm)
@@ -304,7 +303,7 @@ def wrapped_make_train():
     print(f"  TOTAL_TIMESTEPS: {unified_config['TOTAL_TIMESTEPS']:.0e}")
     print(f"  PARAMETER_SHARING: {unified_config['PARAMETER_SHARING']}")
     print(f"  USE_SEPARATE_REWARDS: {unified_config.get('USE_SEPARATE_REWARDS', False)}")
-    print(f"  Individual Rewards: {not unified_config['ENV_KWARGS']['shared_rewards']}")
+    print(f"  Shared Rewards: {unified_config['ENV_KWARGS']['shared_rewards']}")
     if algorithm == "lgtom":
         print(f"  USE_TOM: {unified_config.get('USE_TOM', False)}")
         print(f"  USE_INTRINSIC_REWARD: {unified_config.get('USE_INTRINSIC_REWARD', False)}")
@@ -332,63 +331,86 @@ def wrapped_make_train():
         raise
 
 def main():
-    """Main function to set up and run the wandb sweep"""
-    
-    # Define sweep configuration with explicit experiment IDs
-    sweep_config = {
-        "name": "compare_algorithms_coins_sweep",
-        "method": "grid",
-        "metric": {
-            "name": "returned_episode_returns",
-            "goal": "maximize",
-        },
-        "parameters": {
-            "experiment_id": {
-                "values": [0, 1, 2, 3, 4, 5]  # 6 experiments total
+    """Set up and run the two required wandb sweeps."""
+
+    def make_sweep_config(name, experiment_ids, seeds, extra_parameters=None):
+        parameters = {
+            "experiment_id": {"values": experiment_ids},
+            "SEED": {"values": seeds},
+        }
+        if extra_parameters:
+            for key, value in extra_parameters.items():
+                parameters[key] = {"value": value}
+        return {
+            "name": name,
+            "method": "grid",
+            "metric": {
+                "name": "returned_episode_returns",
+                "goal": "maximize",
             },
-            "SEED": {
-                "values": [1, 2, 3, 4, 5]  # 5 seeds
-            }
+            "parameters": parameters,
+        }
+
+    sweeps = [
+        {
+            "title": "LG-TOM Variants (Default Settings)",
+            "experiment_ids": [0, 1, 2, 3],
+            "seeds": [1, 2, 3],
+            "extra_params": {},
+            "description": (
+                "Social Influence, LG-ToM, LangGround, and Proto using individual rewards, "
+                "no parameter sharing, and joint reward heads."
+            ),
         },
-    }
-    
-    # Login to wandb
+        {
+            "title": "All Methods (Shared Setup)",
+            "experiment_ids": [0, 1, 2, 3, 4, 5],
+            "seeds": [1, 2, 3],
+            "extra_params": {
+                "shared_rewards": True,
+                "PARAMETER_SHARING": True,
+                "USE_SEPARATE_REWARDS": True,
+            },
+            "description": (
+                "All algorithms with shared environment rewards, parameter sharing enabled, "
+                "and separate reward heads."
+            ),
+        },
+    ]
+
     wandb.login()
-    
-    # Create sweep
-    sweep_id = wandb.sweep(
-        sweep_config, 
-        entity="",  # Set your entity if needed
-        project="socialjax"
-    )
-    
-    print("\n" + "="*70)
-    print("Starting WandB Sweep: Algorithm Comparison on Coin Game")
-    print(f"Sweep ID: {sweep_id}")
-    print(f"\nExperiments:")
-    print(f"  0. Social Influence: use_ToM, ground_truth_supervision, use intrinsic")
-    print(f"  1. LG-ToM: use_ToM, llm_supervision, use intrinsic")
-    print(f"  2. LangGround: no_ToM, llm_supervision on communication, no intrinsic")
-    print(f"  3. Proto: no_ToM, no intrinsic")
-    print(f"  4. AutoEncoder: AUTOENCODER_LOSS_COEF=1")
-    print(f"  5. InfoPG: k=1")
-    print(f"\nCommon Settings:")
-    print(f"  - Seeds: [1, 2, 3, 4, 5] (swept over)")
-    print(f"  - Total Timesteps: 1e8")
-    print(f"  - Individual Rewards (shared_rewards=False)")
-    print(f"  - No Parameter Sharing (PARAMETER_SHARING=False)")
-    print(f"  - Joint Rewards (USE_SEPARATE_REWARDS=False)")
-    print(f"  - Influence Target: belief")
-    print(f"  - Communication: Enabled (USE_COMM=True)")
-    print(f"\nWhen Available:")
-    print(f"  - COMM_LOSS_COEF: 1")
-    print(f"  - SOCIAL_INFLUENCE_COEFF: 1")
-    print(f"  - SUPERVISED_LOSS_COEF: 0.1")
-    print(f"\nTotal Runs: 6 experiments × 5 seeds = 30 runs")
-    print("="*70 + "\n")
-    
-    # Run sweep agent - 6 experiments × 5 seeds = 30 total runs
-    wandb.agent(sweep_id, wrapped_make_train, count=30)
+
+    for sweep in sweeps:
+        sweep_config = make_sweep_config(
+            name=sweep["title"],
+            experiment_ids=sweep["experiment_ids"],
+            seeds=sweep["seeds"],
+            extra_parameters=sweep["extra_params"],
+        )
+
+        sweep_id = wandb.sweep(
+            sweep_config,
+            entity="",
+            project="socialjax",
+        )
+
+        total_runs = len(sweep["experiment_ids"]) * len(sweep["seeds"])
+        print("\n" + "=" * 70)
+        print(f"Starting WandB Sweep: {sweep['title']}")
+        print(f"Description: {sweep['description']}")
+        print(f"Sweep ID: {sweep_id}")
+        print(f"Experiments: {sweep['experiment_ids']}")
+        print(f"Seeds: {sweep['seeds']}")
+        if sweep["extra_params"]:
+            print("Extra Parameters:")
+            for key, value in sweep["extra_params"].items():
+                print(f"  - {key}: {value}")
+        else:
+            print("Extra Parameters: (defaults)")
+        print(f"Total Runs: {total_runs}")
+        print("=" * 70 + "\n")
+
+        wandb.agent(sweep_id, wrapped_make_train, count=total_runs)
 
 if __name__ == "__main__":
     main()
