@@ -412,18 +412,40 @@ class LLMDatasetBuilder:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build dataset from LLM trajectories")
+    parser = argparse.ArgumentParser(
+        description="Build dataset from LLM trajectories or combine existing datasets",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Build a new dataset
+  python build_llm_dataset.py --input-dir llms/llm_simulation_output --output-dir llms/llm_datasets
+
+  # Combine two datasets
+  python build_llm_dataset.py --combine \\
+      --dataset1 llms/llm_datasets/llm_dataset_coins_semantic_key.pkl \\
+      --dataset2 llms/llm_datasets_new/llm_dataset_coins_semantic_key.pkl \\
+      --output llms/llm_datasets/llm_dataset_coins_combined.pkl
+        """
+    )
+    
+    # Subcommands: build or combine
+    parser.add_argument(
+        '--combine',
+        action='store_true',
+        help='Combine two existing datasets instead of building a new one'
+    )
+    
+    # Arguments for building dataset
     parser.add_argument(
         '--input-dir',
         type=str,
-        required=True,
-        help='Directory containing LLM trajectory files'
+        help='Directory containing LLM trajectory files (required for build mode)'
     )
     parser.add_argument(
         '--output-dir',
         type=str,
         default='llms/llm_datasets',
-        help='Output directory for dataset files'
+        help='Output directory for dataset files (for build mode)'
     )
     parser.add_argument(
         '--embedding-model',
@@ -476,29 +498,232 @@ def main():
         help='Only process directories starting with this prefix'
     )
     
-    args = parser.parse_args()
-    
-    # Build dataset
-    builder = LLMDatasetBuilder(
-        embedding_model=args.embedding_model,
-        embedding_dim=args.embedding_dim,
-        game_type=args.game_type,
-        obs_normalization=args.obs_normalization,
-        api_key=args.api_key,
-        base_url=args.base_url
+    # Arguments for combining datasets
+    parser.add_argument(
+        '--dataset1',
+        type=str,
+        help='Path to first dataset pickle file (required for combine mode)'
+    )
+    parser.add_argument(
+        '--dataset2',
+        type=str,
+        help='Path to second dataset pickle file (required for combine mode)'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        help='Output path for combined dataset (for combine mode)'
     )
     
-    stats = builder.build_dataset(args.input_dir, pattern=args.pattern, filter_prefix=args.filter_prefix)
+    args = parser.parse_args()
     
-    # Save dataset
-    output_path = Path(args.output_dir) / f"llm_dataset_{args.game_type}_semantic_key.pkl"
-    builder.save_dataset(output_path, save_faiss_index=False)
+    if args.combine:
+        # Combine mode
+        if not args.dataset1 or not args.dataset2:
+            parser.error("--combine requires --dataset1 and --dataset2")
+        
+        if not args.output:
+            parser.error("--combine requires --output")
+        
+        combine_datasets(args.dataset1, args.dataset2, args.output)
+    else:
+        # Build mode
+        if not args.input_dir:
+            parser.error("--input-dir is required for build mode")
+        
+        # Build dataset
+        builder = LLMDatasetBuilder(
+            embedding_model=args.embedding_model,
+            embedding_dim=args.embedding_dim,
+            game_type=args.game_type,
+            obs_normalization=args.obs_normalization,
+            api_key=args.api_key,
+            base_url=args.base_url
+        )
+        
+        stats = builder.build_dataset(args.input_dir, pattern=args.pattern, filter_prefix=args.filter_prefix)
+        
+        # Save dataset
+        output_path = Path(args.output_dir) / f"llm_dataset_{args.game_type}_semantic_key.pkl"
+        builder.save_dataset(output_path, save_faiss_index=False)
+        
+        # Save statistics
+        stats_path = Path(args.output_dir) / f"llm_dataset_{args.game_type}_semantic_key_stats.json"
+        with open(stats_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+        print(f"Saved statistics to {stats_path}")
+
+
+def combine_datasets(
+    dataset1_path: str,
+    dataset2_path: str,
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Combine two LLM trajectory datasets, averaging embeddings when the same key
+    has multiple values.
     
-    # Save statistics
-    stats_path = Path(args.output_dir) / f"llm_dataset_{args.game_type}_semantic_key_stats.json"
-    with open(stats_path, 'w') as f:
-        json.dump(stats, f, indent=2)
-    print(f"Saved statistics to {stats_path}")
+    Args:
+        dataset1_path: Path to first dataset pickle file
+        dataset2_path: Path to second dataset pickle file
+        output_path: Optional path to save combined dataset. If None, dataset is not saved.
+        
+    Returns:
+        Dictionary containing combined dataset with same structure as input datasets:
+        {
+            'dataset': Dict[Tuple, Dict],
+            'embedding_dim': int,
+            'game_type': str,
+            'color_to_idx': dict,
+            'coin_color_to_idx': dict,
+            'action_to_idx': dict
+        }
+    """
+    # Load first dataset
+    print(f"Loading dataset 1 from: {dataset1_path}")
+    with open(dataset1_path, 'rb') as f:
+        data1 = pickle.load(f)
+    
+    # Load second dataset
+    print(f"Loading dataset 2 from: {dataset2_path}")
+    with open(dataset2_path, 'rb') as f:
+        data2 = pickle.load(f)
+    
+    # Validate that datasets are compatible
+    if data1['embedding_dim'] != data2['embedding_dim']:
+        raise ValueError(
+            f"Embedding dimensions don't match: "
+            f"dataset1={data1['embedding_dim']}, dataset2={data2['embedding_dim']}"
+        )
+    
+    if data1['game_type'] != data2['game_type']:
+        raise ValueError(
+            f"Game types don't match: "
+            f"dataset1={data1['game_type']}, dataset2={data2['game_type']}"
+        )
+    
+    dataset1 = data1['dataset']
+    dataset2 = data2['dataset']
+    
+    # Combine datasets
+    combined_dataset = {}
+    keys_with_multiple_values = set()
+    
+    # Track all embeddings for each key for averaging
+    belief_embeddings_accumulator: Dict[Tuple, List] = defaultdict(list)
+    comm_embeddings_accumulator: Dict[Tuple, List] = defaultdict(list)
+    
+    # Process dataset1
+    for key, value in dataset1.items():
+        if value.get('belief_embedding') is not None:
+            belief_embeddings_accumulator[key].append(value['belief_embedding'])
+        if value.get('communication_embedding') is not None:
+            comm_embeddings_accumulator[key].append(value['communication_embedding'])
+    
+    # Process dataset2
+    for key, value in dataset2.items():
+        if value.get('belief_embedding') is not None:
+            belief_embeddings_accumulator[key].append(value['belief_embedding'])
+        if value.get('communication_embedding') is not None:
+            comm_embeddings_accumulator[key].append(value['communication_embedding'])
+    
+    # Combine all unique keys from both datasets
+    all_keys = set(dataset1.keys()) | set(dataset2.keys())
+    
+    for key in all_keys:
+        # Get values from both datasets (prefer dataset2 if key exists in both)
+        value1 = dataset1.get(key)
+        value2 = dataset2.get(key)
+        
+        # Average belief embeddings if multiple exist
+        avg_belief_embedding = None
+        if key in belief_embeddings_accumulator:
+            belief_list = belief_embeddings_accumulator[key]
+            if belief_list:
+                avg_belief_embedding = np.mean(belief_list, axis=0).astype(np.float32)
+                # Re-normalize after averaging
+                norm = np.linalg.norm(avg_belief_embedding)
+                if norm > 0:
+                    avg_belief_embedding = avg_belief_embedding / norm
+                if len(belief_list) > 1:
+                    keys_with_multiple_values.add(key)
+        
+        # Average communication embeddings if multiple exist
+        avg_comm_embedding = None
+        if key in comm_embeddings_accumulator:
+            comm_list = comm_embeddings_accumulator[key]
+            if comm_list:
+                avg_comm_embedding = np.mean(comm_list, axis=0).astype(np.float32)
+                # Re-normalize after averaging
+                norm = np.linalg.norm(avg_comm_embedding)
+                if norm > 0:
+                    avg_comm_embedding = avg_comm_embedding / norm
+                if len(comm_list) > 1:
+                    keys_with_multiple_values.add(key)
+        
+        # Combine text fields (prefer non-empty, then dataset2, then dataset1)
+        belief_text = ''
+        if value2 and value2.get('belief_text'):
+            belief_text = value2['belief_text']
+        elif value1 and value1.get('belief_text'):
+            belief_text = value1['belief_text']
+        
+        communication_text = ''
+        if value2 and value2.get('communication_text'):
+            communication_text = value2['communication_text']
+        elif value1 and value1.get('communication_text'):
+            communication_text = value1['communication_text']
+        
+        # Combine metadata (merge dictionaries, prefer dataset2 values)
+        metadata = {}
+        if value1 and value1.get('metadata'):
+            metadata.update(value1['metadata'])
+        if value2 and value2.get('metadata'):
+            metadata.update(value2['metadata'])
+        
+        # Add source information to metadata
+        if 'sources' not in metadata:
+            metadata['sources'] = []
+        if value1:
+            metadata['sources'].append('dataset1')
+        if value2:
+            metadata['sources'].append('dataset2')
+        
+        combined_dataset[key] = {
+            'belief_embedding': avg_belief_embedding,
+            'communication_embedding': avg_comm_embedding,
+            'belief_text': belief_text,
+            'communication_text': communication_text,
+            'metadata': metadata
+        }
+    
+    # Build combined data structure
+    combined_data = {
+        'dataset': combined_dataset,
+        'embedding_dim': data1['embedding_dim'],
+        'game_type': data1['game_type'],
+        'color_to_idx': data1.get('color_to_idx', {}),
+        'coin_color_to_idx': data1.get('coin_color_to_idx', {}),
+        'action_to_idx': data1.get('action_to_idx', {})
+    }
+    
+    # Print statistics
+    print(f"\nCombined Dataset Statistics:")
+    print(f"  Dataset 1 entries: {len(dataset1)}")
+    print(f"  Dataset 2 entries: {len(dataset2)}")
+    print(f"  Combined unique keys: {len(combined_dataset)}")
+    print(f"  Keys with multiple values (averaged): {len(keys_with_multiple_values)}")
+    print(f"  Embedding dimension: {combined_data['embedding_dim']}")
+    
+    # Save if output path provided
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'wb') as f:
+            pickle.dump(combined_data, f)
+        print(f"Saved combined dataset to: {output_path}")
+    
+    return combined_data
 
 
 if __name__ == "__main__":

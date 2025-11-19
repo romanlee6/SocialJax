@@ -1,0 +1,92 @@
+================================================================================
+SIMULATION SUMMARY
+================================================================================
+
+EXPERIMENT METADATA:
+  Model: gpt-5.1_reasoning-medium
+  Temperature: 0.0
+  Seed: 3
+  Timestamp: 2025-11-19_16-28-32
+  Total Timesteps: 20
+
+================================================================================
+TOKEN USAGE AND TIME
+================================================================================
+  Total Prompt Tokens: 0
+  Total Completion Tokens: 0
+  Total Tokens: 183356
+  Total API Time: 463.49 seconds
+  Average Time per Timestep: 23.174 seconds
+
+================================================================================
+AGENT PERFORMANCE
+================================================================================
+
+Agent 0:
+  Total Reward: 0.00
+  Average Return per Timestep: 0.0000
+  Number of Communications Sent: 20
+  Total Iron Ore Mined: 0
+  Total Gold Ore Mined: 0
+  Action Distribution:
+    up: 12 times (60.0%)
+    left: 8 times (40.0%)
+
+Agent 1:
+  Total Reward: 0.00
+  Average Return per Timestep: 0.0000
+  Number of Communications Sent: 20
+  Total Iron Ore Mined: 0
+  Total Gold Ore Mined: 0
+  Action Distribution:
+    up: 15 times (75.0%)
+    stay: 4 times (20.0%)
+    down: 1 times (5.0%)
+
+Agent 2:
+  Total Reward: 0.00
+  Average Return per Timestep: 0.0000
+  Number of Communications Sent: 20
+  Total Iron Ore Mined: 0
+  Total Gold Ore Mined: 0
+  Action Distribution:
+    right: 16 times (80.0%)
+    down: 4 times (20.0%)
+
+Agent 3:
+  Total Reward: 0.00
+  Average Return per Timestep: 0.0000
+  Number of Communications Sent: 19
+  Total Iron Ore Mined: 0
+  Total Gold Ore Mined: 0
+  Action Distribution:
+    right: 10 times (50.0%)
+    up: 10 times (50.0%)
+
+Agent 4:
+  Total Reward: 0.00
+  Average Return per Timestep: 0.0000
+  Number of Communications Sent: 20
+  Total Iron Ore Mined: 0
+  Total Gold Ore Mined: 0
+  Action Distribution:
+    down: 20 times (100.0%)
+
+Agent 5:
+  Total Reward: 0.00
+  Average Return per Timestep: 0.0000
+  Number of Communications Sent: 20
+  Total Iron Ore Mined: 0
+  Total Gold Ore Mined: 0
+  Action Distribution:
+    up: 13 times (65.0%)
+    right: 7 times (35.0%)
+
+================================================================================
+ENVIRONMENT METRICS
+================================================================================
+  Average Iron Ore in Environment: 0.00
+  Average Gold Ore in Environment: 0.00
+  Average Partially Mined Gold Ore in Environment: 0.00
+
+================================================================================

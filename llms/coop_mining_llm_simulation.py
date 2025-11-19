@@ -711,31 +711,33 @@ COMMUNICATION: [Your message to other agents, or "[No message]"]
 # ============================================================================
 
 class ActionParser:
-    """Converts LLM action strings to environment action indices."""
+    """Converts LLM action strings to environment action indices.
     
-    # Map absolute directions to environment actions
-    # The environment uses relative actions, so we need agent direction to convert
-    ABSOLUTE_ACTION_MAP = {
-        'up': 4,      # forward when facing north, maps to forward
-        'down': 5,    # backward when facing north, maps to backward  
-        'left': 2,    # step_left
-        'right': 3,   # step_right
+    The coop_mining environment takes absolute actions directly:
+    - forward (4) = move up (decrease row)
+    - backward (5) = move down (increase row)
+    - step_left (2) = move left (decrease col)
+    - step_right (3) = move right (increase col)
+    
+    No conversion based on agent orientation is needed.
+    """
+    
+    # Map LLM action strings to environment action indices
+    # Environment uses absolute directions in grid coordinates
+    ACTION_MAP = {
+        'up': 4,           # forward = move up (decrease row)
+        'down': 5,         # backward = move down (increase row)
+        'left': 2,         # step_left = move left (decrease col)
+        'right': 3,        # step_right = move right (increase col)
         'turn_left': 0,
         'turn_right': 1,
         'stay': 6,
-        'mine': 7
-    }
-    
-    # Legacy relative actions for backward compatibility
-    RELATIVE_ACTION_MAP = {
-        'turn_left': 0,
-        'turn_right': 1,
-        'step_left': 2,
-        'step_right': 3,
-        'forward': 4,
-        'backward': 5,
-        'stay': 6,
-        'mine': 7
+        'mine': 7,
+        # Legacy relative action names for backward compatibility
+        'forward': 4,      # same as 'up'
+        'backward': 5,     # same as 'down'
+        'step_left': 2,    # same as 'left'
+        'step_right': 3,   # same as 'right'
     }
     
     @staticmethod
@@ -743,77 +745,41 @@ class ActionParser:
         """
         Convert action string to action index.
         
-        For absolute directions (up, down, left, right), we need to convert
-        to relative actions based on agent's current direction.
+        The environment takes absolute actions, so no conversion based on
+        agent orientation is needed. The agent_direction parameter is
+        kept for backward compatibility but is not used.
+        
+        Args:
+            action_str: Action string from LLM (e.g., "up", "down", "left", "right")
+            agent_direction: Ignored (kept for backward compatibility)
+            
+        Returns:
+            Action index (0-7) for the environment
         """
         action_str = action_str.lower().strip()
         
-        # Try absolute direction first
-        if action_str in ActionParser.ABSOLUTE_ACTION_MAP:
-            abs_action = action_str
-            if abs_action in ['up', 'down', 'left', 'right'] and agent_direction is not None:
-                # Convert absolute direction to relative action based on agent's facing direction
-                # direction: 0=North, 1=East, 2=South, 3=West
-                # Up = decreasing row (north), Down = increasing row (south)
-                # Left = decreasing col (west), Right = increasing col (east)
-                if abs_action == 'up':
-                    # Up means decreasing row (north)
-                    if agent_direction == 0:  # Facing north
-                        return 4  # forward (north = up)
-                    elif agent_direction == 1:  # Facing east
-                        return 2  # step_left (north = up)
-                    elif agent_direction == 2:  # Facing south
-                        return 5  # backward (north = up)
-                    else:  # Facing west (3)
-                        return 3  # step_right (north = up)
-                elif abs_action == 'down':
-                    # Down means increasing row (south)
-                    if agent_direction == 0:  # Facing north
-                        return 5  # backward (south = down)
-                    elif agent_direction == 1:  # Facing east
-                        return 3  # step_right (south = down)
-                    elif agent_direction == 2:  # Facing south
-                        return 4  # forward (south = down)
-                    else:  # Facing west (3)
-                        return 2  # step_left (south = down)
-                elif abs_action == 'left':
-                    # Left means decreasing col (west)
-                    if agent_direction == 0:  # Facing north
-                        return 2  # step_left (west = left)
-                    elif agent_direction == 1:  # Facing east
-                        return 5  # backward (west = left)
-                    elif agent_direction == 2:  # Facing south
-                        return 3  # step_right (west = left)
-                    else:  # Facing west (3)
-                        return 4  # forward (west = left)
-                elif abs_action == 'right':
-                    # Right means increasing col (east)
-                    if agent_direction == 0:  # Facing north
-                        return 3  # step_right (east = right)
-                    elif agent_direction == 1:  # Facing east
-                        return 4  # forward (east = right)
-                    elif agent_direction == 2:  # Facing south
-                        return 2  # step_left (east = right)
-                    else:  # Facing west (3)
-                        return 5  # backward (east = right)
-            else:
-                # turn_left, turn_right, stay, mine don't need conversion
-                return ActionParser.ABSOLUTE_ACTION_MAP[abs_action]
+        # Direct mapping - environment uses absolute actions
+        if action_str in ActionParser.ACTION_MAP:
+            return ActionParser.ACTION_MAP[action_str]
         
-        # Fall back to relative actions for backward compatibility
-        if action_str in ActionParser.RELATIVE_ACTION_MAP:
-            return ActionParser.RELATIVE_ACTION_MAP[action_str]
-        
-        # Default to 'stay'
+        # Default to 'stay' if action not recognized
         return 6
     
     @staticmethod
     def action_to_string(action_idx: int) -> str:
         """Convert action index to string."""
-        for name, idx in ActionParser.ABSOLUTE_ACTION_MAP.items():
-            if idx == action_idx:
-                return name
-        return "stay"
+        # Reverse mapping
+        idx_to_name = {
+            0: 'turn_left',
+            1: 'turn_right',
+            2: 'left',  # or 'step_left'
+            3: 'right',  # or 'step_right'
+            4: 'up',     # or 'forward'
+            5: 'down',   # or 'backward'
+            6: 'stay',
+            7: 'mine'
+        }
+        return idx_to_name.get(action_idx, 'stay')
 
 
 # ============================================================================
@@ -1518,9 +1484,6 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
         state_new_np = jax.tree_util.tree_map(lambda x: np.array(x), state_new)
         rewards_new_np = np.array(rewards_new)
         
-        # Clear JAX computation cache periodically to free GPU memory
-        if t % 10 == 0:
-            jax.clear_backends()
         
         # Send all communications (they'll be available in next timestep)
         for i, comm in enumerate(communications):

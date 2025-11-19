@@ -88,7 +88,7 @@ def create_base_config():
     """Create base configuration with common settings"""
     return {
         "SEED": 1,  # Default seed, will be overridden by sweep parameter
-        "TOTAL_TIMESTEPS": 5e7,
+        "TOTAL_TIMESTEPS": 1e8,
         "REWARD": "individual",
         "PARAMETER_SHARING": False,
         "USE_SEPARATE_REWARDS": False,  # Joint rewards
@@ -118,6 +118,7 @@ def create_base_config():
         "ANNEAL_LR": True,
         "NUM_SEEDS": 1,
         "GIF_NUM_FRAMES": 250,
+        'SUPERVISED_LOSS_TYPE': "mse",
         # WandB settings
         "ENTITY": "",
         "PROJECT": "socialjax",
@@ -140,18 +141,18 @@ def configure_lgtom(config, variant):
         # Condition 1: use_ToM, ground_truth_supervision, use intrinsic
         config["USE_TOM"] = True
         config["USE_INTRINSIC_REWARD"] = True
-        config["SOCIAL_INFLUENCE_COEFF"] = 1.0
+        config["SOCIAL_INFLUENCE_COEFF"] = 0.1
         config["SUPERVISED_BELIEF"] = "ground_truth"
         config["SUPERVISED_COMM"] = "none"
-        config["SUPERVISED_LOSS_COEF"] = 0.1
+        config["SUPERVISED_LOSS_COEF"] = 1.0
     elif variant == "lgtom":
         # Condition 2: use_ToM, llm_supervision, use intrinsic
         config["USE_TOM"] = True
         config["USE_INTRINSIC_REWARD"] = True
-        config["SOCIAL_INFLUENCE_COEFF"] = 1.0
+        config["SOCIAL_INFLUENCE_COEFF"] = 0.1
         config["SUPERVISED_BELIEF"] = "llm"
         config["SUPERVISED_COMM"] = "none"
-        config["SUPERVISED_LOSS_COEF"] = 0.1
+        config["SUPERVISED_LOSS_COEF"] = 1.0
     elif variant == "langground":
         # Condition 3: no_ToM, llm_supervision on communication, no intrinsic
         config["USE_TOM"] = False
@@ -159,7 +160,7 @@ def configure_lgtom(config, variant):
         config["SOCIAL_INFLUENCE_COEFF"] = 0.0
         config["SUPERVISED_BELIEF"] = "none"
         config["SUPERVISED_COMM"] = "llm"
-        config["SUPERVISED_LOSS_COEF"] = 0.1
+        config["SUPERVISED_LOSS_COEF"] = 1.0
     elif variant == "proto":
         # Condition 4: no_ToM, no intrinsic
         config["USE_TOM"] = False
@@ -353,27 +354,17 @@ def main():
 
     sweeps = [
         {
-            "title": "LG-TOM Variants (Default Settings)",
-            "experiment_ids": [0, 1, 2, 3],
-            "seeds": [1, 2, 3],
-            "extra_params": {},
-            "description": (
-                "Social Influence, LG-ToM, LangGround, and Proto using individual rewards, "
-                "no parameter sharing, and joint reward heads."
-            ),
-        },
-        {
-            "title": "All Methods (Shared Setup)",
+            "title": "Benchmarking Experiments (Fix comm loss and gradient flow)",
             "experiment_ids": [0, 1, 2, 3, 4, 5],
-            "seeds": [1, 2, 3],
+            "seeds": [220, 330, 42],
             "extra_params": {
-                "shared_rewards": True,
-                "PARAMETER_SHARING": True,
-                "USE_SEPARATE_REWARDS": True,
+                "shared_rewards": False,
+                "PARAMETER_SHARING": False,
+                "USE_SEPARATE_REWARDS": False,
             },
             "description": (
-                "All algorithms with shared environment rewards, parameter sharing enabled, "
-                "and separate reward heads."
+                "All algorithms using individual rewards, no parameter sharing, "
+                "and joint reward heads."
             ),
         },
     ]

@@ -962,9 +962,9 @@ def load_offline_llm_dataset(data_path, env_name, config):
             'up': 4, 'down': 5, 'stay': 6
         })
         
-        # Get grid size from config or use default for coins environment
-        # For coins: grid_size = (16, 11) -> x: 0-15, y: 0-10
-        if env_name == "CoinGame" or "coins" in env_name.lower():
+        # Get grid size from config or use default for coop_mining environment
+        # For coop_mining: use default grid size from environment
+        if env_name == "CoopMining" or "coop_mining" in env_name.lower():
             grid_size_row, grid_size_col = 16, 11
         else:
             # Try to get from config, default to reasonable values
@@ -2455,7 +2455,9 @@ def make_train_comm(config):
                 metric = metric[0]
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+            # Coin-specific metric (skip for coop_mining)
+            if "eat_own_coins" in metric:
+                metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
             
             # Log social influence rewards separately if enabled
             if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
@@ -2883,7 +2885,9 @@ def make_train(config):
                 # jax.debug.callback(callback, metric)
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+            # Coin-specific metric (skip for coop_mining)
+            if "eat_own_coins" in metric:
+                metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
             jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, update_step, rng)
@@ -2920,14 +2924,13 @@ def single_run(config):
         tags.append("IND")
         name_suffix += "_ind"
     
-    env_name = config.get("ENV_NAME", "coin_game")
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=tags,
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'{name_suffix}_{env_name}'
+        name=f'{name_suffix}_coop_mining'
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -3028,8 +3031,7 @@ def evaluate_comm(params, env, save_path, config):
     pics = []
     img = env.render(state)
     pics.append(img)
-    env_name = config.get("ENV_NAME", "coin_game")
-    root_dir = f"evaluation/{env_name}_comm"
+    root_dir = f"evaluation/coop_mining_comm"
     path = Path(root_dir + "/state_pics")
     path.mkdir(parents=True, exist_ok=True)
 
@@ -3143,8 +3145,7 @@ def evaluate(params, env, save_path, config):
     pics = []
     img = env.render(state)
     pics.append(img)
-    env_name = config.get("ENV_NAME", "coin_game")
-    root_dir = f"evaluation/{env_name}"
+    root_dir = f"evaluation/coop_mining"
     path = Path(root_dir + "/state_pics")
     path.mkdir(parents=True, exist_ok=True)
 
@@ -3243,7 +3244,7 @@ def tune(default_config):
     sweep_config = {
         "name": "lgtom_coefficient_sweep",
         "method": "grid",  # Try all combinations
-        "program": "lgtom_cnn_coins.py",  # The script to run
+        "program": "lgtom_cnn_coop_mining.py",  # The script to run
         "metric": {
             "name": "returned_episode_returns",
             "goal": "maximize",
@@ -3391,7 +3392,7 @@ def tune(default_config):
     wandb.agent(sweep_id, wrapped_make_train, count=total_runs)
 
 
-@hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_coins")
+@hydra.main(version_base=None, config_path="config", config_name="lgtom_cnn_coop_mining")
 def main(config):
     if config["TUNE"]:
         tune(config)

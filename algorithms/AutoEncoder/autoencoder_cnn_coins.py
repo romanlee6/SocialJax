@@ -136,8 +136,9 @@ class ProtoLayer(nn.Module):
         
         # Get communication vector from prototypes
         comm_vector = jnp.dot(samples, prototypes)
+        comm_index = jnp.argmax(samples, axis=-1)
         
-        return comm_vector, logits
+        return comm_vector, logits, comm_index
 
 
 class ActorCriticComm(nn.Module):
@@ -191,7 +192,7 @@ class ActorCriticComm(nn.Module):
         
         # Get RNG for Gumbel-Softmax if in training mode
         gumbel_rng = self.make_rng('gumbel') if train_mode else None
-        comm_vector, comm_logits = proto_layer(comm_hidden, train_mode=train_mode, rng=gumbel_rng)
+        comm_vector, comm_logits, comm_index = proto_layer(comm_hidden, train_mode=train_mode, rng=gumbel_rng)
         
         # 5. Decoder Head: Reconstruct embedding from communication vector
         # Maps from comm_dim (64) back to embedding_dim (64)
@@ -233,7 +234,16 @@ class ActorCriticComm(nn.Module):
         # belief: the GRU output used for action/comm generation
         # new_hidden_state: the carry state for next timestep
         # reconstructed_embedding: reconstructed embedding from comm_vector for autoencoder loss
-        return action_logits, comm_vector, comm_logits, jnp.squeeze(value, axis=-1), new_hidden_state, belief, reconstructed_embedding
+        return (
+            action_logits,
+            comm_vector,
+            comm_logits,
+            comm_index,
+            jnp.squeeze(value, axis=-1),
+            new_hidden_state,
+            belief,
+            reconstructed_embedding,
+        )
 
 
 class ActorCritic(nn.Module):
@@ -281,6 +291,7 @@ class TransitionComm(NamedTuple):
     obs: jnp.ndarray
     comm_vector: jnp.ndarray
     comm_log_prob: jnp.ndarray
+    comm_action: jnp.ndarray
     hidden_state: jnp.ndarray
     belief_state: jnp.ndarray  # Belief state (GRU output)
     embedding: jnp.ndarray  # Original embedding for autoencoder loss
@@ -976,7 +987,7 @@ def make_train_comm(config):
                         {'params': train_state.params['params']['CNN_0']},
                         obs_batch
                     )
-                    action_logits, comm_vectors, comm_logits, values, new_hidden_batch, belief_batch, reconstructed_embedding = network.apply(
+                    action_logits, comm_vectors, comm_logits, comm_indices, values, new_hidden_batch, belief_batch, reconstructed_embedding = network.apply(
                         train_state.params,
                         obs_batch,
                         prev_comm_batch,
@@ -993,7 +1004,7 @@ def make_train_comm(config):
                     
                     # Communication log probs
                     comm_pi = distrax.Categorical(logits=comm_logits)
-                    comm_log_probs = comm_pi.entropy()
+                    comm_log_probs = comm_pi.log_prob(comm_indices)
                     
                     # Reshape back to (num_envs, num_agents, ...)
                     actions_reshaped = actions.reshape(config["NUM_ENVS"], env.num_agents)
@@ -1010,6 +1021,7 @@ def make_train_comm(config):
                     values = []
                     comm_vectors_list = []
                     comm_log_probs_list = []
+                    comm_indices_list = []
                     new_hidden_list = []
                     action_logits_list = []
                     belief_batch_list = []
@@ -1024,7 +1036,7 @@ def make_train_comm(config):
                             {'params': train_state[i].params['params']['CNN_0']},
                             obs_batch[i]
                         )
-                        action_logits_i, comm_vectors_i, comm_logits_i, values_i, new_hidden_i, belief_i, reconstructed_embedding_i = network[i].apply(
+                        action_logits_i, comm_vectors_i, comm_logits_i, comm_index_i, values_i, new_hidden_i, belief_i, reconstructed_embedding_i = network[i].apply(
                             train_state[i].params,
                             obs_batch[i],
                             prev_comm[:, i],
@@ -1044,7 +1056,8 @@ def make_train_comm(config):
                         # Communication
                         comm_vectors_list.append(comm_vectors_i)
                         comm_pi_i = distrax.Categorical(logits=comm_logits_i)
-                        comm_log_probs_list.append(comm_pi_i.entropy())
+                        comm_log_probs_list.append(comm_pi_i.log_prob(comm_index_i))
+                        comm_indices_list.append(comm_index_i)
                         new_hidden_list.append(new_hidden_i)
                         
                         # Store for autoencoder loss
@@ -1065,6 +1078,7 @@ def make_train_comm(config):
                     values = jnp.concatenate(values, axis=0)
                     comm_vectors = comm_vectors_reshaped.reshape(-1, config.get("COMM_DIM", 64))
                     comm_log_probs = jnp.concatenate(comm_log_probs_list, axis=0)
+                    comm_indices = jnp.concatenate(comm_indices_list, axis=0)
                     
                     # Stack for use in training
                     action_logits_reshaped = action_logits_list  # List for easier indexing
@@ -1118,6 +1132,7 @@ def make_train_comm(config):
                         obs_batch,
                         comm_vectors,
                         comm_log_probs,
+                        comm_indices,
                         hidden_batch,
                         belief_batch,  # Store belief states
                         embedding_batch,  # Store original embeddings for autoencoder loss
@@ -1154,6 +1169,7 @@ def make_train_comm(config):
                             obs_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             comm_vectors[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             comm_log_probs[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
+                            comm_indices[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             hidden_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],
                             agent_belief,  # Store belief states
                             agent_embedding,  # Store original embeddings for autoencoder loss
@@ -1177,7 +1193,7 @@ def make_train_comm(config):
                 last_hidden_batch = hidden_states.reshape(-1, config.get("HIDDEN_DIM", 128))
                 last_comm_batch = prev_comm.reshape(-1, config.get("COMM_DIM", 64))
                 
-                _, _, _, last_val, _, _, _ = network.apply(
+                _, _, _, _, last_val, _, _, _ = network.apply(
                     train_state.params,
                     last_obs_batch,
                     last_comm_batch,
@@ -1189,7 +1205,7 @@ def make_train_comm(config):
                 last_obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
                 last_val = []
                 for i in range(env.num_agents):
-                    _, _, _, last_val_i, _, _, _ = network[i].apply(
+                    _, _, _, _, last_val_i, _, _, _ = network[i].apply(
                         train_state[i].params,
                         last_obs_batch[i],
                         prev_comm[:, i],
@@ -1343,7 +1359,7 @@ def make_train_comm(config):
                             {'params': params['params']['CNN_0']},
                             traj_batch.obs
                         )
-                        action_logits, _, comm_logits, values, _, belief_recomputed, reconstructed_embedding = network_used.apply(
+                        action_logits, _, comm_logits, _, values, _, belief_recomputed, reconstructed_embedding = network_used.apply(
                             params,
                             traj_batch.obs,
                             traj_batch.prev_comm,  # Use stored received/aggregated communication
@@ -1355,11 +1371,6 @@ def make_train_comm(config):
                         # Action policy
                         pi = distrax.Categorical(logits=action_logits)
                         log_prob = pi.log_prob(traj_batch.action)
-                        
-                        # Communication policy
-                        comm_pi = distrax.Categorical(logits=comm_logits)
-                        # Get the actual selected comm (from stored comm_log_prob, we can't directly get it)
-                        # We'll use the entropy-based loss for comm policy
                         
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -1387,13 +1398,31 @@ def make_train_comm(config):
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
                         
-                        # CALCULATE COMMUNICATION POLICY LOSS
-                        # For communication, we use a policy gradient approach based on the comm advantages
-                        # Since comm uses Gumbel-Softmax, we optimize the logits directly
-                        comm_gae_normalized = (comm_gae - comm_gae.mean()) / (comm_gae.std() + 1e-8)
+                        # COMMUNICATION POLICY LOSS (PPO-style)
+                        comm_pi = distrax.Categorical(logits=comm_logits)
+                        
+                        # 2. Calculate log_prob of the comm actions we took
+                        new_comm_log_prob = comm_pi.log_prob(traj_batch.comm_action)
+                        
+                        # 3. Calculate Ratio (pi_new / pi_old)
+                        comm_ratio = jnp.exp(new_comm_log_prob - traj_batch.comm_log_prob)
+                        
+                        # 4. Normalize Advantages (Crucial for stability in PPO)
+                        comm_gae = (comm_gae - comm_gae.mean()) / (comm_gae.std() + 1e-8)
+                        
+                        # 5. Calculate PPO Clipped Loss
+                        loss_comm1 = comm_ratio * comm_gae
+                        loss_comm2 = jnp.clip(
+                            comm_ratio,
+                            1.0 - config["CLIP_EPS"],
+                            1.0 + config["CLIP_EPS"]
+                        ) * comm_gae
+                        
+                        # Maximize advantage (minimize negative min)
+                        loss_comm = -jnp.minimum(loss_comm1, loss_comm2).mean()
+                        
+                        # Optional: Entropy Bonus to prevent mode collapse
                         comm_entropy = comm_pi.entropy().mean()
-                        # Loss for comm: negative advantage-weighted entropy (encourages high-reward comms)
-                        loss_comm = -comm_gae_normalized.mean() * comm_entropy
                         
                         # CALCULATE AUTOENCODER RECONSTRUCTION LOSS
                         # MSE loss between original embedding and reconstructed embedding from comm_vector
@@ -1404,6 +1433,7 @@ def make_train_comm(config):
                             + config.get("COMM_LOSS_COEF", 0.1) * loss_comm  # Separate coefficient for comm loss
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
+                            - config.get("COMM_ENT_COEF", 0.0) * comm_entropy
                             + config.get("AUTOENCODER_LOSS_COEF", 0.1) * autoencoder_loss  # Autoencoder reconstruction loss
                         )
                         return total_loss, (value_loss, loss_actor, loss_comm, entropy, comm_entropy, autoencoder_loss)
@@ -2037,7 +2067,7 @@ def evaluate_comm(params, env, save_path, config):
         rng, _rng = jax.random.split(rng)
         
         if config.get("PARAMETER_SHARING", True):
-            action_logits, comm_vectors, _, _, new_hidden_states, _, _ = network.apply(
+            action_logits, comm_vectors, _, _, _, new_hidden_states, _, _ = network.apply(
                 params,
                 obs_batch,
                 prev_comm,
@@ -2057,7 +2087,7 @@ def evaluate_comm(params, env, save_path, config):
             new_hidden_list = []
             
             for i in range(env.num_agents):
-                action_logits_i, comm_vectors_i, _, _, new_hidden_i, _, _ = network[i].apply(
+                action_logits_i, comm_vectors_i, _, _, _, new_hidden_i, _, _ = network[i].apply(
                     params[i],
                     jnp.expand_dims(obs_batch[i], axis=0),
                     jnp.expand_dims(prev_comm[i], axis=0),
