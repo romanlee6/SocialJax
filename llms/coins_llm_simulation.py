@@ -1283,7 +1283,7 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     comm_manager = CommunicationManager(num_agents=2)
     
     # Initialize OpenAI client for embeddings
-    embedding_client = OpenAI()
+    embedding_client = None
     
     # Create display name for logging (include reasoning if specified)
     if model == "gpt-5.1" and reasoning and reasoning != "none":
@@ -1505,7 +1505,7 @@ if __name__ == "__main__":
         )
     else:
         # Multiple runs with different seeds
-        seeds = list(range(10, 10 + args.num_runs))
+        seeds = list(range(17, 17 + args.num_runs))
         for i, seed in enumerate(seeds):
             print(f"\n{'='*70}")
             print(f"Run {i+1}/{args.num_runs} with seed {seed}")
