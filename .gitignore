@@ -7,4 +7,6 @@ llms/llm_benchmarks/
 llms/llm_simulation_output/
 llm_simulation_output/
 llm_simulation_coop/
+llm_simulation_coop_final/
+llms/llms/
 *.pickle

@@ -1,13 +1,14 @@
 """
-Unified WandB sweep script to compare methods on Coop Mining environment.
+Unified WandB sweep script to compare LGTOM and LangGround on Coop Mining environment.
 
 Usage:
     python compare_algorithms_sweep.py
 
 Running this file launches a WandB sweep comparing:
-   - Social Influence, Proto, InfoPG, AutoEncoder
-   - Seeds: [42,52,62,110]
-   - Fixed settings: individual rewards, no parameter sharing, joint reward heads
+   - LGTOM (LG-TOM with LLM supervision on beliefs)
+   - LangGround (LLM supervision on communication, no ToM)
+   - Seeds: [1, 2, 5, 42, 52, 62, 110, 222]
+   - Uses LLM dataset: llms/llms/llm_datasets/llm_dataset_coop_mining_semantic_key.pkl
 """
 import sys
 import os
@@ -32,7 +33,7 @@ def import_module_from_path(module_name, file_path):
     spec.loader.exec_module(module)
     return module
 
-# Import training functions from each algorithm using file paths
+# Import training functions from LGTOM algorithm
 # Handle hyphenated directory name "LG-TOM"
 base_path = Path(__file__).parent
 lgtom_module = import_module_from_path(
@@ -118,6 +119,8 @@ def create_base_config():
         "NUM_SEEDS": 1,
         "GIF_NUM_FRAMES": 250,
         'SUPERVISED_LOSS_TYPE': "mse",
+        # LLM dataset path for supervision
+        "LLM_DATA_PATH": "llms/llms/llm_datasets/llm_dataset_coop_mining_semantic_key.pkl",
         # WandB settings
         "ENTITY": "",
         "PROJECT": "socialjax",
@@ -193,7 +196,7 @@ def configure_autoencoder(config):
     return config
 
 def run_training(config, algorithm_name, variant=None):
-    """Run training for a specific algorithm configuration"""
+    """Run training for LGTOM algorithm configuration"""
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
     
@@ -224,10 +227,12 @@ def wrapped_make_train():
     
     # Define all experiments explicitly
     experiments = {
-        0: {"algorithm": "lgtom", "variant": "social_influence", "name": "Social Influence"},
-        1: {"algorithm": "lgtom", "variant": "proto", "name": "Proto"},
-        2: {"algorithm": "infopg", "variant": None, "name": "InfoPG"},
-        3: {"algorithm": "autoencoder", "variant": None, "name": "AutoEncoder"},
+        # 0: {"algorithm": "lgtom", "variant": "social_influence", "name": "Social Influence"},
+        # 1: {"algorithm": "lgtom", "variant": "proto", "name": "Proto"},
+        # 2: {"algorithm": "infopg", "variant": None, "name": "InfoPG"},
+        # 3: {"algorithm": "autoencoder", "variant": None, "name": "AutoEncoder"},
+        5: {"algorithm": "lgtom", "variant": "lgtom", "name": "LGTOM"},
+        6: {"algorithm": "lgtom", "variant": "langground", "name": "LangGround"},
     }
     
     if experiment_id not in experiments:
@@ -352,17 +357,17 @@ def main():
     sweeps = [
         {
             "title": "Coop Mining Comparison: Social Influence, Proto, InfoPG, AutoEncoder",
-            "experiment_ids": [0, 1, 2, 3],
-            "seeds": [62],
+            "experiment_ids": [5,6],
+            "seeds": [110],
             "extra_params": {
                 "shared_rewards": False,
                 "PARAMETER_SHARING": False,
                 "USE_SEPARATE_REWARDS": False,
             },
             "description": (
-                "Comparing methods on coop_mining environment: "
-                "Social Influence, Proto, InfoPG, AutoEncoder. "
-                "Fixed settings: individual rewards, no parameter sharing, joint reward heads."
+                "Comparing LGTOM vs LangGround on coop_mining environment using LLM dataset. "
+                "LGTOM: LLM supervision on beliefs with ToM. LangGround: LLM supervision on communication without ToM. "
+                "Dataset: llms/llms/llm_datasets/llm_dataset_coop_mining_semantic_key.pkl"
             ),
         },
     ]

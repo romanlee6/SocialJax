@@ -92,6 +92,11 @@ class ObservationDescriptor:
         desc_parts.append(f"Your position: row {agent_row}, col {agent_col}.")
         desc_parts.append(f"Your orientation: facing {direction_name}.")
         
+        # Add ASCII map of observation (using absolute coordinates)
+        num_agents = len(all_agent_locs)
+        ascii_map = obs_to_ascii_map(grid, agent_loc, all_agent_locs, self.agent_id, num_agents)
+        desc_parts.append("\n" + ascii_map)
+        
         # Check for adjacent walls (within 1 step in cardinal directions)
         adjacent_walls = []
         grid_rows, grid_cols = grid.shape[0], grid.shape[1]
@@ -304,6 +309,170 @@ class ObservationDescriptor:
         if vertical and horizontal:
             return f"{vertical} and {horizontal}"
         return vertical or horizontal
+
+
+def obs_to_ascii_map(grid: np.ndarray, agent_loc: np.ndarray, all_agent_locs: np.ndarray, 
+                     agent_id: int, num_agents: int) -> str:
+    """
+    Convert agent's field of view to ASCII map representation using absolute coordinates.
+    
+    The map shows the agent's FOV in absolute grid coordinates (not rotated).
+    FOV: forward=9, backward=1, left=5, right=5
+    
+    Args:
+        grid: Full grid state array of shape (rows, cols)
+        agent_loc: Agent's location [row, col, direction]
+        all_agent_locs: All agents' locations from state
+        agent_id: ID of the current agent (0-indexed)
+        num_agents: Total number of agents in the environment
+        
+    Returns:
+        ASCII map string representing the agent's field of view in absolute coordinates
+    """
+    # FOV parameters
+    forward_range = 9
+    backward_range = 1
+    left_range = 5
+    right_range = 5
+    
+    agent_row, agent_col, direction = int(agent_loc[0]), int(agent_loc[1]), int(agent_loc[2])
+    grid_rows, grid_cols = grid.shape
+    
+    # Helper function to check if a position is in FOV (accounting for orientation)
+    def is_in_fov(obj_row: int, obj_col: int) -> Tuple[bool, int, int]:
+        """Check if object is in FOV and return relative coordinates."""
+        rel_row = obj_row - agent_row
+        rel_col = obj_col - agent_col
+        
+        # Transform relative position based on agent's orientation
+        if direction == 0:  # Facing North (Up)
+            forward = -rel_row
+            backward = rel_row
+            left = -rel_col
+            right = rel_col
+        elif direction == 1:  # Facing East (Right)
+            forward = rel_col
+            backward = -rel_col
+            left = rel_row
+            right = -rel_row
+        elif direction == 2:  # Facing South (Down)
+            forward = rel_row
+            backward = -rel_row
+            left = rel_col
+            right = -rel_col
+        else:  # direction == 3, Facing West (Left)
+            forward = -rel_col
+            backward = rel_col
+            left = -rel_row
+            right = rel_row
+        
+        in_forward = 0 <= forward <= forward_range
+        in_backward = 0 <= backward <= backward_range
+        in_left = 0 <= left <= left_range
+        in_right = 0 <= right <= right_range
+        
+        if (in_forward or in_backward) and (in_left or in_right):
+            return True, rel_row, rel_col
+        return False, rel_row, rel_col
+    
+    # Determine the bounding box to display
+    # Show a square area around the agent that encompasses the FOV
+    # FOV is asymmetric: forward=9, backward=1, left=5, right=5
+    # So we need at least 11 rows (9+1+1) and 11 cols (5+5+1) centered on agent
+    view_size = max(forward_range + backward_range + 1, left_range + right_range + 1)
+    view_half = view_size // 2
+    
+    view_min_row = max(0, agent_row - view_half)
+    view_max_row = min(grid_rows - 1, agent_row + view_half)
+    view_min_col = max(0, agent_col - view_half)
+    view_max_col = min(grid_cols - 1, agent_col + view_half)
+    
+    # ASCII character mapping
+    ascii_chars = {
+        Items.empty: '.',           # Empty space
+        Items.wall: 'W',            # Wall
+        Items.ore_wait: 'O',        # Ore wait (empty ore spawn point)
+        Items.spawn_point: 'P',     # Spawn point
+        Items.iron_ore: 'I',        # Iron ore
+        Items.gold_ore: 'G',        # Gold ore
+        Items.gold_partial: 'g',    # Partially mined gold (flashing)
+    }
+    
+    # Create ASCII map with absolute coordinates
+    lines = []
+    direction_names = ["Up (North)", "Right (East)", "Down (South)", "Left (West)"]
+    
+    for row in range(view_min_row, view_max_row + 1):
+        line_chars = []
+        for col in range(view_min_col, view_max_col + 1):
+            # Check if this cell is in FOV
+            in_fov, rel_row, rel_col = is_in_fov(row, col)
+            
+            # Check if there's an agent at this position
+            agent_at_pos = None
+            for i, other_loc in enumerate(all_agent_locs):
+                other_row, other_col = int(other_loc[0]), int(other_loc[1])
+                if other_row == row and other_col == col:
+                    agent_at_pos = i
+                    break
+            
+            if agent_at_pos is not None:
+                if agent_at_pos == agent_id:
+                    line_chars.append('@')
+                else:
+                    line_chars.append(str(agent_at_pos))
+            else:
+                # Get item from grid
+                if 0 <= row < grid_rows and 0 <= col < grid_cols:
+                    cell = grid[row, col]
+                    char = ascii_chars.get(cell, '?')
+                    # Mark cells outside FOV with 'x' to indicate they're not visible
+                    if not in_fov:
+                        char = 'x'  # Outside FOV
+                    line_chars.append(char)
+                else:
+                    line_chars.append(' ')  # Out of bounds
+        
+        # Add row coordinate
+        lines.append((row, ''.join(line_chars)))
+    
+    # Build result with header
+    result = []
+    result.append("=== Agent's Field of View (ASCII Map - Absolute Coordinates) ===")
+    result.append(f"Agent {agent_id} at position: row {agent_row}, col {agent_col}")
+    result.append(f"Orientation: {direction_names[direction]}")
+    result.append("")
+    result.append("Legend:")
+    result.append("  @ = You (Agent {})".format(agent_id))
+    result.append("  0-{} = Other agents".format(num_agents - 1))
+    result.append("  W = Wall")
+    result.append("  . = Empty space")
+    result.append("  O = Ore spawn point (empty)")
+    result.append("  P = Spawn point")
+    result.append("  I = Iron ore")
+    result.append("  G = Gold ore")
+    result.append("  g = Gold ore (partially mined, flashing)")
+    result.append("  x = Outside field of view")
+    result.append("")
+    result.append("Coordinate system: (0,0) is top-left, row increases down, col increases right")
+    result.append("")
+    
+    # Add column header
+    col_header = "     "
+    for col in range(view_min_col, view_max_col + 1):
+        col_header += str(col % 10)
+    result.append(col_header)
+    result.append("")
+    
+    # Add the map with row coordinates
+    for row, line in lines:
+        row_label = f"{row:3d} "
+        if row == agent_row:
+            result.append(f"{row_label}{line}  <- You are here")
+        else:
+            result.append(f"{row_label}{line}")
+    
+    return "\n".join(result)
 
 
 # ============================================================================

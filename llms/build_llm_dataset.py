@@ -34,6 +34,7 @@ import json
 import argparse
 import numpy as np
 import pickle
+import csv
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
@@ -101,15 +102,32 @@ class LLMDatasetBuilder:
         self._comm_embeddings_accumulator: Dict[Tuple, List] = defaultdict(list)
         self._repeated_key_count = 0  # Count how many times we see a repeated key
         
-        # Action mapping
-        self.action_to_idx = {
-            'turn_left': 0, 'turn_right': 1, 'left': 2, 'right': 3,
-            'up': 4, 'down': 5, 'stay': 6
-        }
+        # Action mapping - support both coins and coop_mining
+        if game_type == 'coins':
+            self.action_to_idx = {
+                'turn_left': 0, 'turn_right': 1, 'left': 2, 'right': 3,
+                'up': 4, 'down': 5, 'stay': 6
+            }
+        elif game_type == 'coop_mining':
+            self.action_to_idx = {
+                'turn_left': 0, 'turn_right': 1, 'left': 2, 'right': 3,
+                'up': 4, 'down': 5, 'stay': 6, 'mine': 7,
+                # Legacy support
+                'forward': 4, 'backward': 5, 'step_left': 2, 'step_right': 3
+            }
+        else:
+            # Default to coins for backward compatibility
+            self.action_to_idx = {
+                'turn_left': 0, 'turn_right': 1, 'left': 2, 'right': 3,
+                'up': 4, 'down': 5, 'stay': 6
+            }
         
-        # Color encoding
+        # Color encoding (for coins)
         self.color_to_idx = {'red': 0, 'green': 1}
         self.coin_color_to_idx = {'none': 0, 'red': 1, 'green': 2}
+        
+        # Ore type encoding (for coop_mining)
+        self.ore_type_to_idx = {'none': 0, 'iron': 1, 'gold': 2, 'gold_partial': 3}
     
     def _get_embedding(self, text: str) -> np.ndarray:
         """
@@ -142,35 +160,69 @@ class LLMDatasetBuilder:
         """
         Convert semantic_key to numerical vector for exact matching.
         
-        Args:
-            semantic_key: [agent_color, agent_x, agent_y, closest_coin_color, agent_id, action]
-            
+        Supports two formats:
+        - coins: [agent_color, agent_x, agent_y, closest_coin_color, agent_id, action]
+        - coop_mining: [agent_id, agent_row, agent_col, closest_ore_type, num_agents_in_fov, action]
+        
         Returns:
-            Tuple of [color_encoded, x, y, coin_color_encoded, action_idx]
+            For coins: Tuple of [color_encoded, x, y, coin_color_encoded, action_idx]
+            For coop_mining: Tuple of [agent_id, row, col, ore_type_encoded, num_agents_in_fov, action_idx]
         """
         if len(semantic_key) != 6:
             raise ValueError(f"Expected semantic_key of length 6, got {len(semantic_key)}")
         
-        agent_color, agent_x, agent_y, closest_coin_color, agent_id, action = semantic_key
+        if self.game_type == 'coins':
+            # Coins format: [agent_color, agent_x, agent_y, closest_coin_color, agent_id, action]
+            agent_color, agent_x, agent_y, closest_coin_color, agent_id, action = semantic_key
+            
+            # Encode color: red=0, green=1
+            color_encoded = self.color_to_idx.get(agent_color.lower(), 0)
+            
+            # Keep x, y as integers
+            x = int(agent_x)
+            y = int(agent_y)
+            
+            # Encode coin color: none=0, red=1, green=2
+            coin_color_encoded = self.coin_color_to_idx.get(closest_coin_color.lower() if closest_coin_color else 'none', 0)
+            
+            # Convert action to index
+            if isinstance(action, str):
+                action_idx = self.action_to_idx.get(action, 6)
+            else:
+                action_idx = int(action)
+            
+            # Return as tuple for dictionary key (removed agent_id as redundant)
+            return (color_encoded, x, y, coin_color_encoded, action_idx)
         
-        # Encode color: red=0, green=1
-        color_encoded = self.color_to_idx.get(agent_color.lower(), 0)
+        elif self.game_type == 'coop_mining':
+            # Coop_mining format: [agent_id, agent_row, agent_col, closest_ore_type, num_agents_in_fov, action]
+            agent_id, agent_row, agent_col, closest_ore_type, num_agents_in_fov, action = semantic_key
+            
+            # Keep agent_id, row, col as integers
+            agent_id_encoded = int(agent_id)
+            row = int(agent_row)
+            col = int(agent_col)
+            
+            # Encode ore type: none=0, iron=1, gold=2, gold_partial=3
+            ore_type_encoded = self.ore_type_to_idx.get(
+                closest_ore_type.lower() if closest_ore_type and isinstance(closest_ore_type, str) else 'none', 
+                0
+            )
+            
+            # Keep num_agents_in_fov as integer
+            num_agents_in_fov_encoded = int(num_agents_in_fov)
+            
+            # Convert action to index
+            if isinstance(action, str):
+                action_idx = self.action_to_idx.get(action, 6)
+            else:
+                action_idx = int(action)
+            
+            # Return as tuple for dictionary key
+            return (agent_id_encoded, row, col, ore_type_encoded, num_agents_in_fov_encoded, action_idx)
         
-        # Keep x, y as integers
-        x = int(agent_x)
-        y = int(agent_y)
-        
-        # Encode coin color: none=0, red=1, green=2
-        coin_color_encoded = self.coin_color_to_idx.get(closest_coin_color.lower() if closest_coin_color else 'none', 0)
-        
-        # Convert action to index
-        if isinstance(action, str):
-            action_idx = self.action_to_idx.get(action, 6)
         else:
-            action_idx = int(action)
-        
-        # Return as tuple for dictionary key (removed agent_id as redundant)
-        return (color_encoded, x, y, coin_color_encoded, action_idx)
+            raise ValueError(f"Unsupported game_type: {self.game_type}")
     
     def _process_trajectory_file(self, trajectory_path: Path) -> int:
         """
@@ -381,7 +433,8 @@ class LLMDatasetBuilder:
     def save_dataset(
         self,
         output_path: str,
-        save_faiss_index: bool = False
+        save_faiss_index: bool = False,
+        save_csv: bool = True
     ):
         """
         Save dataset to disk.
@@ -389,6 +442,7 @@ class LLMDatasetBuilder:
         Args:
             output_path: Path to save dataset (.pkl file)
             save_faiss_index: Not used (kept for compatibility)
+            save_csv: Whether to save CSV file with text, semantic key, and embeddings
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -404,11 +458,77 @@ class LLMDatasetBuilder:
             'action_to_idx': self.action_to_idx
         }
         
+        # Add coop_mining-specific mappings if applicable
+        if self.game_type == 'coop_mining':
+            save_data['ore_type_to_idx'] = self.ore_type_to_idx
+        
         # Save main dataset
         with open(output_path, 'wb') as f:
             pickle.dump(save_data, f)
         print(f"Saved dataset to {output_path}")
         print(f"  Dataset size: {len(self.dataset)} entries")
+        
+        # Save CSV file with text, semantic key, and embeddings
+        if save_csv:
+            csv_path = output_path.with_suffix('.csv')
+            self._save_csv(csv_path)
+    
+    def _save_csv(self, csv_path: Path):
+        """
+        Save dataset to CSV file with original text, semantic key, and embeddings.
+        
+        Args:
+            csv_path: Path to save CSV file
+        """
+        print(f"Saving CSV to {csv_path}")
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            # Determine column names based on game type
+            if self.game_type == 'coins':
+                fieldnames = [
+                    'semantic_key', 'agent_id', 'timestep', 'trajectory_file',
+                    'belief_text', 'communication_text',
+                    'belief_embedding', 'communication_embedding'
+                ]
+            else:  # coop_mining
+                fieldnames = [
+                    'semantic_key', 'agent_id', 'timestep', 'trajectory_file',
+                    'belief_text', 'communication_text',
+                    'belief_embedding', 'communication_embedding'
+                ]
+            
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for key_vector, entry in self.dataset.items():
+                # Convert semantic key tuple to string for CSV
+                semantic_key_str = str(key_vector)
+                
+                # Convert embeddings to string (comma-separated values)
+                belief_emb_str = ''
+                if entry.get('belief_embedding') is not None:
+                    belief_emb = entry['belief_embedding']
+                    belief_emb_str = ','.join(map(str, belief_emb))
+                
+                comm_emb_str = ''
+                if entry.get('communication_embedding') is not None:
+                    comm_emb = entry['communication_embedding']
+                    comm_emb_str = ','.join(map(str, comm_emb))
+                
+                row = {
+                    'semantic_key': semantic_key_str,
+                    'agent_id': entry.get('metadata', {}).get('agent_id', ''),
+                    'timestep': entry.get('metadata', {}).get('timestep', ''),
+                    'trajectory_file': entry.get('metadata', {}).get('trajectory_file', ''),
+                    'belief_text': entry.get('belief_text', ''),
+                    'communication_text': entry.get('communication_text', ''),
+                    'belief_embedding': belief_emb_str,
+                    'communication_embedding': comm_emb_str
+                }
+                
+                writer.writerow(row)
+        
+        print(f"  CSV file size: {len(self.dataset)} entries")
 
 
 def main():
@@ -474,7 +594,7 @@ Examples:
     parser.add_argument(
         '--game-type',
         type=str,
-        choices=['coins', 'territory'],
+        choices=['coins', 'territory', 'coop_mining'],
         default='coins',
         help='Type of game'
     )
@@ -545,7 +665,7 @@ Examples:
         
         # Save dataset
         output_path = Path(args.output_dir) / f"llm_dataset_{args.game_type}_semantic_key.pkl"
-        builder.save_dataset(output_path, save_faiss_index=False)
+        builder.save_dataset(output_path, save_faiss_index=False, save_csv=True)
         
         # Save statistics
         stats_path = Path(args.output_dir) / f"llm_dataset_{args.game_type}_semantic_key_stats.json"

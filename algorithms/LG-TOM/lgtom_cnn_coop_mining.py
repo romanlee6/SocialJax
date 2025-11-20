@@ -3220,10 +3220,10 @@ def single_run(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["LGTOM", "COMM", "ToM",'Intrinsic','Ground_truth'],
+        tags=["LGTOM", "COMM", "ToM",'Intrinsic','LLM'],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'social_coop_mining'
+        name=f'LG-TOM_coop_mining'
     )
 
     rng = jax.random.PRNGKey(config["SEED"])

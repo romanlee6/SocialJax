@@ -49,10 +49,10 @@
 
 # Theory of Mind (ToM) Parameters
 "USE_TOM": True  # Enable Theory of Mind prediction model
-"SUPERVISED_BELIEF": "ground_truth"  # Supervised belief training: "none", "ground_truth", or "llm"
+"SUPERVISED_BELIEF": "llm"  # Supervised belief training: "none", "ground_truth", or "llm"
 "SUPERVISED_COMM": "none"  # Supervised communication training: "none", "ground_truth", or "llm"
 "SUPERVISED_LOSS_COEF": 1  # Weight for supervised learning loss
-"LLM_DATA_PATH": ""  # Path to offline LLM dataset (empty for now, will be set up later)
+"LLM_DATA_PATH": "llms/llms/llm_datasets/llm_dataset_coop_mining_semantic_key.pkl"  # Path to offline LLM dataset (empty for now, will be set up later)
 # NOTE: When USE_TOM=True, supervised loss is ALWAYS backpropagated (if SUPERVISED_BELIEF != "none")
 # LOSS FUNCTION: Uses cosine similarity loss (1 - cos_sim) for both belief and communication
 #   - Belief supervision: ToM prediction vs other agents' actual belief states
