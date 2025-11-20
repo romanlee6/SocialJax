@@ -701,6 +701,7 @@ class CoopMining(MultiAgentEnv):
             info = {}
 
         info["mining_gold"] = rewards_gold * self.num_agents
+        info["mining_iron"] = rewards_iron * self.num_agents
 
         # if self.shared_rewards:
         #     total_rewards = jnp.sum(rewards_iron + rewards_gold)  # Scalar

@@ -1,9 +1,9 @@
 "LR": 0.0005
 "NUM_ENVS": 256
-"NUM_STEPS": 996
+"NUM_STEPS": 1000
 "TOTAL_TIMESTEPS": 5e7  # Each sweep run will train for 50M timesteps
 "UPDATE_EPOCHS": 2
-"NUM_MINIBATCHES": 256  # Must evenly divide NUM_ACTORS * NUM_STEPS
+"NUM_MINIBATCHES": 300  # Must evenly divide NUM_ACTORS * NUM_STEPS
 "GAMMA": 0.99
 "GAE_LAMBDA": 0.95
 "CLIP_EPS": 0.2
@@ -16,7 +16,7 @@
 "SHAPING_BEGIN": 1e6
 "ENV_KWARGS": 
   "num_agents" : 6
-  "num_inner_steps" : 996
+  "num_inner_steps" : 1000
   "shared_rewards" : False # Attention: switch to False for individual rewards 
   "num_outer_steps" : 1
   "max_miners" : 4  # how many miners can we store per gold cell
@@ -47,28 +47,10 @@
 "HIDDEN_DIM": 128  # Hidden dimension for GRU (must be embedding_dim + comm_dim = 64 + 64)
 "COMM_MODE": "avg"  # Communication aggregation mode: 'avg' or 'sum'
 
-# Theory of Mind (ToM) Parameters
-"USE_TOM": True  # Enable Theory of Mind prediction model
-"SUPERVISED_BELIEF": "ground_truth"  # Supervised belief training: "none", "ground_truth", or "llm"
-"SUPERVISED_COMM": "none"  # Supervised communication training: "none", "ground_truth", or "llm"
-"SUPERVISED_LOSS_COEF": 1  # Weight for supervised learning loss
-"LLM_DATA_PATH": ""  # Path to offline LLM dataset (empty for now, will be set up later)
-# NOTE: When USE_TOM=True, supervised loss is ALWAYS backpropagated (if SUPERVISED_BELIEF != "none")
-# LOSS FUNCTION: Uses cosine similarity loss (1 - cos_sim) for both belief and communication
-#   - Belief supervision: ToM prediction vs other agents' actual belief states
-#   - Comm supervision: Communication vectors similarity across agents (encourages alignment)
-
-# Intrinsic Reward Parameters
-"USE_INTRINSIC_REWARD": True  # Enable intrinsic reward calculation (can be used with or without ToM)
-"SOCIAL_INFLUENCE_COEFF": 0.1  # Coefficient for social influence intrinsic reward
-"INFLUENCE_TARGET": "belief"  # What to measure influence on: "action" (KL div) or "belief" (cosine sim)
-"USE_SEPARATE_REWARDS": False  # Train action and comm heads with separate rewards
+# AutoEncoder Parameters
+"AUTOENCODER_LOSS_COEF": 1  # Weight for autoencoder reconstruction loss (MSE between original and reconstructed embeddings)
+"USE_SEPARATE_REWARDS": False  # Autoencoder uses same reward for action and comm policies
 "COMM_LOSS_COEF": 1  # Weight for communication policy loss
-'SUPERVISED_LOSS_TYPE': "mse" # "cosine" or "mse"
-# NOTE: Interaction between ToM and Intrinsic Reward:
-#   - If USE_INTRINSIC_REWARD=True AND USE_TOM=True: Uses ToM predictions in counterfactuals (efficient)
-#   - If USE_INTRINSIC_REWARD=True AND USE_TOM=False: Uses ground truth beliefs in influence calculation
-#   - Both modes work with PARAMETER_SHARING=True/False and USE_SEPARATE_REWARDS=True/False
 
 # WandB Params
 "ENTITY": ""
@@ -76,5 +58,6 @@
 "WANDB_MODE" : "online"
 "WANDB_TAGS":
   - INDIVIDUAL_REWARD # COMMON_REWARD
-  - LGTOM_COMM
+  - AUTOENCODER_COMM
+  - COOP_MINING
 

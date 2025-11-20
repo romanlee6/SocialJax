@@ -385,7 +385,7 @@ class TransitionComm(NamedTuple):
     prev_comm: jnp.ndarray  # Received/aggregated communication that was used as input
     info: jnp.ndarray
     agent_positions: jnp.ndarray  # (num_envs * num_agents, 2) - [x, y] positions for semantic key
-    closest_coin_colors: jnp.ndarray  # (num_envs * num_agents,) - closest coin color indices (0=none, 1=red, 2=green)
+    closest_ore_types: jnp.ndarray  # (num_envs * num_agents,) - closest ore type indices (0=none, 1=iron, 2=gold)
 
 
 class Transition(NamedTuple):
@@ -784,18 +784,18 @@ def compute_kl_divergence(p, q, epsilon=1e-8):
 
 
 
-def find_closest_coin_in_fov_jax(agent_x, agent_y, agent_direction, grid):
+def find_closest_ore_in_fov_jax(agent_x, agent_y, agent_direction, grid):
     """
-    Find the closest coin in the agent's field of view (JAX-compatible).
+    Find the closest ore in the agent's field of view (JAX-compatible).
     
     Args:
-        agent_x: jnp.ndarray or int, agent x position
-        agent_y: jnp.ndarray or int, agent y position
-        agent_direction: jnp.ndarray or int, agent direction (0=North, 1=West, 2=South, 3=East)
+        agent_x: jnp.ndarray or int, agent x position (row)
+        agent_y: jnp.ndarray or int, agent y position (col)
+        agent_direction: jnp.ndarray or int, agent direction (0=North, 1=East, 2=South, 3=West)
         grid: jnp.ndarray, grid state (H, W)
         
     Returns:
-        coin_color_idx: int, 0=none, 1=red, 2=green
+        ore_type_idx: int, 0=none, 1=iron, 2=gold (treats gold_partial as gold)
     """
     # Convert to JAX arrays if needed
     agent_x = jnp.asarray(agent_x, dtype=jnp.int32)
@@ -816,45 +816,44 @@ def find_closest_coin_in_fov_jax(agent_x, agent_y, agent_direction, grid):
     X, Y = jnp.meshgrid(x_coords, y_coords, indexing='ij')
     
     # Compute relative positions
-    rel_x = X - agent_x
-    rel_y = Y - agent_y
+    rel_row = X - agent_x
+    rel_col = Y - agent_y
     
     # Transform based on direction using JAX-compatible operations
-    # Direction 0=North, 1=West, 2=South, 3=East
-    # Use jnp.where for conditional logic
-    forward_north = rel_x
-    backward_north = -rel_x
-    left_north = rel_y
-    right_north = -rel_y
+    # Direction 0=North, 1=East, 2=South, 3=West
+    forward_north = -rel_row
+    backward_north = rel_row
+    left_north = -rel_col
+    right_north = rel_col
     
-    forward_west = rel_y
-    backward_west = -rel_y
-    left_west = -rel_x
-    right_west = rel_x
+    forward_east = rel_col
+    backward_east = -rel_col
+    left_east = rel_row
+    right_east = -rel_row
     
-    forward_south = -rel_x
-    backward_south = rel_x
-    left_south = -rel_y
-    right_south = rel_y
+    forward_south = rel_row
+    backward_south = -rel_row
+    left_south = rel_col
+    right_south = -rel_col
     
-    forward_east = -rel_y
-    backward_east = rel_y
-    left_east = rel_x
-    right_east = -rel_x
+    forward_west = -rel_col
+    backward_west = rel_col
+    left_west = -rel_row
+    right_west = rel_row
     
     # Select based on direction
     forward = jnp.where(agent_direction == 0, forward_north,
-               jnp.where(agent_direction == 1, forward_west,
-               jnp.where(agent_direction == 2, forward_south, forward_east)))
+               jnp.where(agent_direction == 1, forward_east,
+               jnp.where(agent_direction == 2, forward_south, forward_west)))
     backward = jnp.where(agent_direction == 0, backward_north,
-                jnp.where(agent_direction == 1, backward_west,
-                jnp.where(agent_direction == 2, backward_south, backward_east)))
+                jnp.where(agent_direction == 1, backward_east,
+                jnp.where(agent_direction == 2, backward_south, backward_west)))
     left = jnp.where(agent_direction == 0, left_north,
-            jnp.where(agent_direction == 1, left_west,
-            jnp.where(agent_direction == 2, left_south, left_east)))
+            jnp.where(agent_direction == 1, left_east,
+            jnp.where(agent_direction == 2, left_south, left_west)))
     right = jnp.where(agent_direction == 0, right_north,
-             jnp.where(agent_direction == 1, right_west,
-             jnp.where(agent_direction == 2, right_south, right_east)))
+             jnp.where(agent_direction == 1, right_east,
+             jnp.where(agent_direction == 2, right_south, right_west)))
     
     # Check if in FOV
     in_forward = (forward >= 0) & (forward <= forward_range)
@@ -864,31 +863,32 @@ def find_closest_coin_in_fov_jax(agent_x, agent_y, agent_direction, grid):
     in_fov = (in_forward | in_backward) & (in_left | in_right)
     
     # Compute distances
-    distances = jnp.sqrt(rel_x**2 + rel_y**2)
+    distances = jnp.sqrt(rel_row**2 + rel_col**2)
     distances = jnp.where(in_fov, distances, jnp.inf)
     
-    # Find red coins (grid value 3)
-    red_coins = (grid == 3) & in_fov
-    red_distances = jnp.where(red_coins, distances, jnp.inf)
-    closest_red_dist = jnp.min(red_distances)
-    has_red = jnp.isfinite(closest_red_dist)
+    # Items.iron_ore = 4, Items.gold_ore = 5, Items.gold_partial = 6
+    # Find iron ores (grid value 4)
+    iron_ores = (grid == 4) & in_fov
+    iron_distances = jnp.where(iron_ores, distances, jnp.inf)
+    closest_iron_dist = jnp.min(iron_distances)
+    has_iron = jnp.isfinite(closest_iron_dist)
     
-    # Find green coins (grid value 4)
-    green_coins = (grid == 4) & in_fov
-    green_distances = jnp.where(green_coins, distances, jnp.inf)
-    closest_green_dist = jnp.min(green_distances)
-    has_green = jnp.isfinite(closest_green_dist)
+    # Find gold ores (grid value 5) and gold_partial (grid value 6) - treat both as gold
+    gold_ores = ((grid == 5) | (grid == 6)) & in_fov
+    gold_distances = jnp.where(gold_ores, distances, jnp.inf)
+    closest_gold_dist = jnp.min(gold_distances)
+    has_gold = jnp.isfinite(closest_gold_dist)
     
-    # Return closest coin color index: 0=none, 1=red, 2=green
-    has_coin = has_red | has_green
-    red_closer = (closest_red_dist < closest_green_dist) & has_red
+    # Return closest ore type index: 0=none, 1=iron, 2=gold
+    has_ore = has_iron | has_gold
+    iron_closer = (closest_iron_dist < closest_gold_dist) & has_iron
     
-    coin_color_idx = jnp.where(
-        ~has_coin, 0,  # No coin
-        jnp.where(red_closer, 1, 2)  # Red or green
+    ore_type_idx = jnp.where(
+        ~has_ore, 0,  # No ore
+        jnp.where(iron_closer, 1, 2)  # Iron or gold
     )
     
-    return coin_color_idx
+    return ore_type_idx
 
 
 
@@ -919,7 +919,7 @@ def load_offline_llm_dataset(data_path, env_name, config):
     Load offline LLM dataset for supervised communication/belief training.
     
     The dataset uses semantic_key vectors as keys for O(1) lookup:
-    - Key: (color_encoded, x, y, coin_color_encoded, action_idx)
+    - For coop_mining: Key: (agent_id, x, y, ore_type_encoded, num_agents_in_fov, action_idx)
     - Value: {
         'belief_embedding': np.ndarray,
         'communication_embedding': np.ndarray,
@@ -955,21 +955,32 @@ def load_offline_llm_dataset(data_path, env_name, config):
         
         dataset = data.get('dataset', {})
         embedding_dim = data.get('embedding_dim', 384)
-        color_to_idx = data.get('color_to_idx', {'red': 0, 'green': 1})
-        coin_color_to_idx = data.get('coin_color_to_idx', {'none': 0, 'red': 1, 'green': 2})
+        
+        # For coop_mining: semantic key structure is different
+        # Key: (agent_id, agent_x, agent_y, closest_ore_type, num_agents_in_fov, action)
+        ore_type_to_idx = data.get('ore_type_to_idx', {'none': 0, 'iron': 1, 'gold': 2})
         action_to_idx = data.get('action_to_idx', {
             'turn_left': 0, 'turn_right': 1, 'left': 2, 'right': 3,
-            'up': 4, 'down': 5, 'stay': 6
+            'up': 4, 'down': 5, 'stay': 6, 'mine': 7
         })
         
-        # Get grid size from config or use default for coop_mining environment
-        # For coop_mining: use default grid size from environment
+        # Get parameters for coop_mining environment
         if env_name == "CoopMining" or "coop_mining" in env_name.lower():
-            grid_size_row, grid_size_col = 16, 11
+            # Grid size for coop_mining is 27x27
+            grid_size_row, grid_size_col = 27, 27
+            # Default number of agents is 4, but can be configured
+            num_agents = config.get("NUM_AGENTS", 4)
+            # Maximum number of agents in FOV (reasonable upper bound)
+            max_num_agents_in_fov = config.get("MAX_NUM_AGENTS_IN_FOV", 10)
         else:
-            # Try to get from config, default to reasonable values
+            # Fallback for other environments (coins)
             grid_size_row = config.get("GRID_SIZE_ROW", 16)
             grid_size_col = config.get("GRID_SIZE_COL", 11)
+            num_agents = 2
+            max_num_agents_in_fov = 2
+            # Keep old mappings for backward compatibility
+            color_to_idx = data.get('color_to_idx', {'red': 0, 'green': 1})
+            coin_color_to_idx = data.get('coin_color_to_idx', {'none': 0, 'red': 1, 'green': 2})
         
         # Get target dimensions from config (shorten embeddings from 256 to target dims)
         belief_target_dim = config.get("HIDDEN_DIM", 128)  # Default 128 for belief
@@ -981,61 +992,130 @@ def load_offline_llm_dataset(data_path, env_name, config):
         print(f"  Belief target dimension: {belief_target_dim}")
         print(f"  Communication target dimension: {comm_target_dim}")
         print(f"  Grid size: ({grid_size_row}, {grid_size_col})")
+        if env_name == "CoopMining" or "coop_mining" in env_name.lower():
+            print(f"  Number of agents: {num_agents}")
+            print(f"  Max agents in FOV: {max_num_agents_in_fov}")
         
         # Create dense embedding tables for JAX lookups with target dimensions
-        # Shape: (num_colors, grid_size_row, grid_size_col, num_coin_colors, num_actions, target_dim)
-        # num_colors = 2 (red=0, green=1)
-        # num_coin_colors = 3 (none=0, red=1, green=2)
-        # num_actions = 7 (0-6)
-        belief_embedding_table = np.zeros(
-            (2, grid_size_row, grid_size_col, 3, 7, belief_target_dim),
-            dtype=np.float32
-        )
-        comm_embedding_table = np.zeros(
-            (2, grid_size_row, grid_size_col, 3, 7, comm_target_dim),
-            dtype=np.float32
-        )
+        # For coop_mining: Shape: (num_agents, grid_size_row, grid_size_col, num_ore_types, max_num_agents_in_fov, num_actions, target_dim)
+        # num_ore_types = 3 (none=0, iron=1, gold=2)
+        # num_actions = 8 (0-7: turn_left, turn_right, left, right, up, down, stay, mine)
+        if env_name == "CoopMining" or "coop_mining" in env_name.lower():
+            belief_embedding_table = np.zeros(
+                (num_agents, grid_size_row, grid_size_col, 3, max_num_agents_in_fov, 8, belief_target_dim),
+                dtype=np.float32
+            )
+            comm_embedding_table = np.zeros(
+                (num_agents, grid_size_row, grid_size_col, 3, max_num_agents_in_fov, 8, comm_target_dim),
+                dtype=np.float32
+            )
+        else:
+            # Backward compatibility for coins
+            belief_embedding_table = np.zeros(
+                (2, grid_size_row, grid_size_col, 3, 7, belief_target_dim),
+                dtype=np.float32
+            )
+            comm_embedding_table = np.zeros(
+                (2, grid_size_row, grid_size_col, 3, 7, comm_target_dim),
+                dtype=np.float32
+            )
         
         # Fill embedding tables from dataset, truncating to target dimensions
         filled_count = 0
         for key_vector, entry in dataset.items():
-            color_encoded, x, y, coin_color_encoded, action = key_vector
-            
-            # Bounds checking
-            if (0 <= color_encoded < 2 and 
-                0 <= x < grid_size_row and 
-                0 <= y < grid_size_col and
-                0 <= coin_color_encoded < 3 and
-                0 <= action < 7):
+            if env_name == "CoopMining" or "coop_mining" in env_name.lower():
+                # For coop_mining: key_vector is (agent_id, x, y, ore_type, num_agents_in_fov, action)
+                if len(key_vector) != 6:
+                    continue
+                agent_id, x, y, ore_type, num_agents_in_fov, action = key_vector
                 
-                # Store belief embedding (truncate from embedding_dim to belief_target_dim)
-                if 'belief_embedding' in entry and entry['belief_embedding'] is not None:
-                    belief_emb = np.array(entry['belief_embedding'], dtype=np.float32)
-                    if belief_emb.shape[0] >= belief_target_dim:
-                        # Truncate by taking first belief_target_dim elements
-                        belief_emb_truncated = belief_emb[:belief_target_dim]
-                    else:
-                        # Pad with zeros if shorter than target
-                        belief_emb_truncated = np.pad(belief_emb, (0, belief_target_dim - belief_emb.shape[0]),
-                                                      mode='constant')
-                    # Normalize after truncation
-                    belief_emb_truncated = normalize_l2(belief_emb_truncated)
-                    belief_embedding_table[color_encoded, x, y, coin_color_encoded, action] = belief_emb_truncated
-                    filled_count += 1
+                # Convert ore_type to encoded index if it's a string
+                if isinstance(ore_type, str):
+                    ore_type_encoded = ore_type_to_idx.get(ore_type.lower(), 0)
+                else:
+                    ore_type_encoded = int(ore_type)
                 
-                # Store communication embedding (truncate from embedding_dim to comm_target_dim)
-                if 'communication_embedding' in entry and entry['communication_embedding'] is not None:
-                    comm_emb = np.array(entry['communication_embedding'], dtype=np.float32)
-                    if comm_emb.shape[0] >= comm_target_dim:
-                        # Truncate by taking first comm_target_dim elements
-                        comm_emb_truncated = comm_emb[:comm_target_dim]
-                    else:
-                        # Pad with zeros if shorter than target
-                        comm_emb_truncated = np.pad(comm_emb, (0, comm_target_dim - comm_emb.shape[0]),
-                                                    mode='constant')
-                    # Normalize after truncation
-                    comm_emb_truncated = normalize_l2(comm_emb_truncated)
-                    comm_embedding_table[color_encoded, x, y, coin_color_encoded, action] = comm_emb_truncated
+                # Convert action to index if it's a string
+                if isinstance(action, str):
+                    action_idx = action_to_idx.get(action.lower(), 6)
+                else:
+                    action_idx = int(action)
+                
+                # Bounds checking for coop_mining
+                if (0 <= agent_id < num_agents and 
+                    0 <= x < grid_size_row and 
+                    0 <= y < grid_size_col and
+                    0 <= ore_type_encoded < 3 and
+                    0 <= num_agents_in_fov < max_num_agents_in_fov and
+                    0 <= action_idx < 8):
+                    
+                    # Store belief embedding (truncate from embedding_dim to belief_target_dim)
+                    if 'belief_embedding' in entry and entry['belief_embedding'] is not None:
+                        belief_emb = np.array(entry['belief_embedding'], dtype=np.float32)
+                        if belief_emb.shape[0] >= belief_target_dim:
+                            # Truncate by taking first belief_target_dim elements
+                            belief_emb_truncated = belief_emb[:belief_target_dim]
+                        else:
+                            # Pad with zeros if shorter than target
+                            belief_emb_truncated = np.pad(belief_emb, (0, belief_target_dim - belief_emb.shape[0]),
+                                                          mode='constant')
+                        # Normalize after truncation
+                        belief_emb_truncated = normalize_l2(belief_emb_truncated)
+                        belief_embedding_table[agent_id, x, y, ore_type_encoded, num_agents_in_fov, action_idx] = belief_emb_truncated
+                        filled_count += 1
+                    
+                    # Store communication embedding (truncate from embedding_dim to comm_target_dim)
+                    if 'communication_embedding' in entry and entry['communication_embedding'] is not None:
+                        comm_emb = np.array(entry['communication_embedding'], dtype=np.float32)
+                        if comm_emb.shape[0] >= comm_target_dim:
+                            # Truncate by taking first comm_target_dim elements
+                            comm_emb_truncated = comm_emb[:comm_target_dim]
+                        else:
+                            # Pad with zeros if shorter than target
+                            comm_emb_truncated = np.pad(comm_emb, (0, comm_target_dim - comm_emb.shape[0]),
+                                                        mode='constant')
+                        # Normalize after truncation
+                        comm_emb_truncated = normalize_l2(comm_emb_truncated)
+                        comm_embedding_table[agent_id, x, y, ore_type_encoded, num_agents_in_fov, action_idx] = comm_emb_truncated
+            else:
+                # Backward compatibility for coins
+                color_encoded, x, y, coin_color_encoded, action = key_vector
+                
+                # Bounds checking
+                if (0 <= color_encoded < 2 and 
+                    0 <= x < grid_size_row and 
+                    0 <= y < grid_size_col and
+                    0 <= coin_color_encoded < 3 and
+                    0 <= action < 7):
+                    
+                    # Store belief embedding (truncate from embedding_dim to belief_target_dim)
+                    if 'belief_embedding' in entry and entry['belief_embedding'] is not None:
+                        belief_emb = np.array(entry['belief_embedding'], dtype=np.float32)
+                        if belief_emb.shape[0] >= belief_target_dim:
+                            # Truncate by taking first belief_target_dim elements
+                            belief_emb_truncated = belief_emb[:belief_target_dim]
+                        else:
+                            # Pad with zeros if shorter than target
+                            belief_emb_truncated = np.pad(belief_emb, (0, belief_target_dim - belief_emb.shape[0]),
+                                                          mode='constant')
+                        # Normalize after truncation
+                        belief_emb_truncated = normalize_l2(belief_emb_truncated)
+                        belief_embedding_table[color_encoded, x, y, coin_color_encoded, action] = belief_emb_truncated
+                        filled_count += 1
+                    
+                    # Store communication embedding (truncate from embedding_dim to comm_target_dim)
+                    if 'communication_embedding' in entry and entry['communication_embedding'] is not None:
+                        comm_emb = np.array(entry['communication_embedding'], dtype=np.float32)
+                        if comm_emb.shape[0] >= comm_target_dim:
+                            # Truncate by taking first comm_target_dim elements
+                            comm_emb_truncated = comm_emb[:comm_target_dim]
+                        else:
+                            # Pad with zeros if shorter than target
+                            comm_emb_truncated = np.pad(comm_emb, (0, comm_target_dim - comm_emb.shape[0]),
+                                                        mode='constant')
+                        # Normalize after truncation
+                        comm_emb_truncated = normalize_l2(comm_emb_truncated)
+                        comm_embedding_table[color_encoded, x, y, coin_color_encoded, action] = comm_emb_truncated
         
         print(f"  Filled {filled_count} entries in embedding tables")
         
@@ -1043,182 +1123,372 @@ def load_offline_llm_dataset(data_path, env_name, config):
         belief_embedding_table_jax = jnp.array(belief_embedding_table, dtype=jnp.float32)
         comm_embedding_table_jax = jnp.array(comm_embedding_table, dtype=jnp.float32)
         
-        def construct_semantic_key_vector(agent_id, agent_x, agent_y, closest_coin_color, action_idx):
-            """
-            Construct semantic key vector from agent state.
-            
-            Args:
-                agent_id: int, agent ID (0=red, 1=green)
-                agent_x: int, agent x position
-                agent_y: int, agent y position
-                closest_coin_color: str or None, closest coin color in FOV ('red', 'green', or None)
-                action_idx: int, action index
+        if env_name == "CoopMining" or "coop_mining" in env_name.lower():
+            def construct_semantic_key_vector(agent_id, agent_x, agent_y, closest_ore_type, num_agents_in_fov, action_idx):
+                """
+                Construct semantic key vector from agent state for coop_mining.
                 
-            Returns:
-                Tuple: (color_encoded, x, y, coin_color_encoded, action_idx)
-            """
-            # Encode color: agent 0 is red, agent 1 is green
-            color_encoded = 0 if agent_id == 0 else 1
-            
-            # Keep x, y as integers
-            x = int(agent_x)
-            y = int(agent_y)
-            
-            # Encode coin color
-            if closest_coin_color is None:
-                coin_color_encoded = 0
-            else:
-                coin_color_encoded = coin_color_to_idx.get(closest_coin_color.lower(), 0)
-            
-            # Action index
-            action = int(action_idx)
-            
-            return (color_encoded, x, y, coin_color_encoded, action)
+                Args:
+                    agent_id: int, agent ID (0 to num_agents-1)
+                    agent_x: int, agent x position (row)
+                    agent_y: int, agent y position (col)
+                    closest_ore_type: str or None, closest ore type in FOV ('iron', 'gold', or None/'none')
+                    num_agents_in_fov: int, number of other agents in field of view
+                    action_idx: int, action index (0-7)
+                    
+                Returns:
+                    Tuple: (agent_id, x, y, ore_type_encoded, num_agents_in_fov, action_idx)
+                """
+                # Keep agent_id, x, y as integers
+                agent_id = int(agent_id)
+                x = int(agent_x)
+                y = int(agent_y)
+                
+                # Encode ore type
+                if closest_ore_type is None or closest_ore_type == 'none':
+                    ore_type_encoded = 0
+                else:
+                    ore_type_encoded = ore_type_to_idx.get(closest_ore_type.lower(), 0)
+                
+                # Keep num_agents_in_fov as integer (clip to max)
+                num_agents_in_fov_clipped = min(int(num_agents_in_fov), max_num_agents_in_fov - 1)
+                
+                # Action index
+                action = int(action_idx)
+                
+                return (agent_id, x, y, ore_type_encoded, num_agents_in_fov_clipped, action)
+        else:
+            # Backward compatibility for coins
+            def construct_semantic_key_vector(agent_id, agent_x, agent_y, closest_coin_color, action_idx):
+                """
+                Construct semantic key vector from agent state.
+                
+                Args:
+                    agent_id: int, agent ID (0=red, 1=green)
+                    agent_x: int, agent x position
+                    agent_y: int, agent y position
+                    closest_coin_color: str or None, closest coin color in FOV ('red', 'green', or None)
+                    action_idx: int, action index
+                    
+                Returns:
+                    Tuple: (color_encoded, x, y, coin_color_encoded, action_idx)
+                """
+                # Encode color: agent 0 is red, agent 1 is green
+                color_encoded = 0 if agent_id == 0 else 1
+                
+                # Keep x, y as integers
+                x = int(agent_x)
+                y = int(agent_y)
+                
+                # Encode coin color
+                if closest_coin_color is None:
+                    coin_color_encoded = 0
+                else:
+                    coin_color_encoded = coin_color_to_idx.get(closest_coin_color.lower(), 0)
+                
+                # Action index
+                action = int(action_idx)
+                
+                return (color_encoded, x, y, coin_color_encoded, action)
         
         # Create separate jitted functions for belief and communication lookups
         # (JAX jit doesn't work well with string-based conditionals)
-        @jax.jit
-        def lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices):
-            """
-            JAX-accelerated parallel belief embedding lookup.
-            
-            Args:
-                agent_ids: (N,) int array, agent IDs (0=red, 1=green)
-                agent_xs: (N,) int array, agent x positions
-                agent_ys: (N,) int array, agent y positions
-                coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
-                action_indices: (N,) int array, action indices (0-6)
+        if env_name == "CoopMining" or "coop_mining" in env_name.lower():
+            # For coop_mining
+            @jax.jit
+            def lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, ore_type_indices, num_agents_in_fov, action_indices):
+                """
+                JAX-accelerated parallel belief embedding lookup for coop_mining.
                 
-            Returns:
-                (N, embedding_dim) float32 array of embeddings
-            """
-            # Encode agent IDs to colors: 0 -> 0 (red), 1 -> 1 (green)
-            color_indices = agent_ids
-            
-            # Clamp indices to valid ranges for safe indexing
-            color_indices = jnp.clip(color_indices, 0, 1)
-            x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
-            y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
-            coin_indices = jnp.clip(coin_color_indices, 0, 2)
-            action_indices_clipped = jnp.clip(action_indices, 0, 6)
-            
-            # Vectorized lookup: belief_embedding_table[color_indices, x_indices, y_indices, coin_indices, action_indices_clipped]
-            embeddings = belief_embedding_table_jax[
-                color_indices,
-                x_indices,
-                y_indices,
-                coin_indices,
-                action_indices_clipped
-            ]  # Shape: (N, belief_target_dim)
-            
-            return embeddings
-        
-        @jax.jit
-        def lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices):
-            """
-            JAX-accelerated parallel communication embedding lookup.
-            
-            Args:
-                agent_ids: (N,) int array, agent IDs (0=red, 1=green)
-                agent_xs: (N,) int array, agent x positions
-                agent_ys: (N,) int array, agent y positions
-                coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
-                action_indices: (N,) int array, action indices (0-6)
+                Args:
+                    agent_ids: (N,) int array, agent IDs (0 to num_agents-1)
+                    agent_xs: (N,) int array, agent x positions (row)
+                    agent_ys: (N,) int array, agent y positions (col)
+                    ore_type_indices: (N,) int array, ore type indices (0=none, 1=iron, 2=gold)
+                    num_agents_in_fov: (N,) int array, number of agents in FOV
+                    action_indices: (N,) int array, action indices (0-7)
+                    
+                Returns:
+                    (N, embedding_dim) float32 array of embeddings
+                """
+                # Clamp indices to valid ranges for safe indexing
+                agent_ids_clipped = jnp.clip(agent_ids, 0, num_agents - 1)
+                x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
+                y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
+                ore_indices = jnp.clip(ore_type_indices, 0, 2)
+                num_agents_fov_clipped = jnp.clip(num_agents_in_fov, 0, max_num_agents_in_fov - 1)
+                action_indices_clipped = jnp.clip(action_indices, 0, 7)
                 
-            Returns:
-                (N, embedding_dim) float32 array of embeddings
-            """
-            # Encode agent IDs to colors: 0 -> 0 (red), 1 -> 1 (green)
-            color_indices = agent_ids
-            
-            # Clamp indices to valid ranges for safe indexing
-            color_indices = jnp.clip(color_indices, 0, 1)
-            x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
-            y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
-            coin_indices = jnp.clip(coin_color_indices, 0, 2)
-            action_indices_clipped = jnp.clip(action_indices, 0, 6)
-            
-            # Vectorized lookup: comm_embedding_table[color_indices, x_indices, y_indices, coin_indices, action_indices_clipped]
-            embeddings = comm_embedding_table_jax[
-                color_indices,
-                x_indices,
-                y_indices,
-                coin_indices,
-                action_indices_clipped
-            ]  # Shape: (N, comm_target_dim)
-            
-            return embeddings
-        
-        def lookup_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices, query_type='belief'):
-            """
-            Wrapper function for JAX-accelerated parallel embedding lookup.
-            
-            Args:
-                agent_ids: (N,) int array, agent IDs (0=red, 1=green)
-                agent_xs: (N,) int array, agent x positions
-                agent_ys: (N,) int array, agent y positions
-                coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
-                action_indices: (N,) int array, action indices (0-6)
-                query_type: str, 'belief' or 'communication'
+                # Vectorized lookup: belief_embedding_table[agent_ids, x_indices, y_indices, ore_indices, num_agents_fov_clipped, action_indices_clipped]
+                embeddings = belief_embedding_table_jax[
+                    agent_ids_clipped,
+                    x_indices,
+                    y_indices,
+                    ore_indices,
+                    num_agents_fov_clipped,
+                    action_indices_clipped
+                ]  # Shape: (N, belief_target_dim)
                 
-            Returns:
-                (N, target_dim) float32 array of embeddings (belief_target_dim for belief, comm_target_dim for comm)
-            """
-            if query_type == 'belief':
-                return lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices)
-            else:
-                return lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices)
-        
-        # Keep old query function for backward compatibility (non-jitted, single query)
-        def query_dataset(agent_id, agent_x, agent_y, closest_coin_color, action_idx, 
-                         query_type='belief'):
-            """
-            Query dataset for belief or communication embedding (single query, non-jitted).
-            For batch queries, use lookup_embeddings_jax instead.
-            """
-            key_vector = construct_semantic_key_vector(
-                agent_id, agent_x, agent_y, closest_coin_color, action_idx
-            )
+                return embeddings
             
-            entry = dataset.get(key_vector, None)
+            @jax.jit
+            def lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, ore_type_indices, num_agents_in_fov, action_indices):
+                """
+                JAX-accelerated parallel communication embedding lookup for coop_mining.
+                
+                Args:
+                    agent_ids: (N,) int array, agent IDs (0 to num_agents-1)
+                    agent_xs: (N,) int array, agent x positions (row)
+                    agent_ys: (N,) int array, agent y positions (col)
+                    ore_type_indices: (N,) int array, ore type indices (0=none, 1=iron, 2=gold)
+                    num_agents_in_fov: (N,) int array, number of agents in FOV
+                    action_indices: (N,) int array, action indices (0-7)
+                    
+                Returns:
+                    (N, embedding_dim) float32 array of embeddings
+                """
+                # Clamp indices to valid ranges for safe indexing
+                agent_ids_clipped = jnp.clip(agent_ids, 0, num_agents - 1)
+                x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
+                y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
+                ore_indices = jnp.clip(ore_type_indices, 0, 2)
+                num_agents_fov_clipped = jnp.clip(num_agents_in_fov, 0, max_num_agents_in_fov - 1)
+                action_indices_clipped = jnp.clip(action_indices, 0, 7)
+                
+                # Vectorized lookup: comm_embedding_table[agent_ids, x_indices, y_indices, ore_indices, num_agents_fov_clipped, action_indices_clipped]
+                embeddings = comm_embedding_table_jax[
+                    agent_ids_clipped,
+                    x_indices,
+                    y_indices,
+                    ore_indices,
+                    num_agents_fov_clipped,
+                    action_indices_clipped
+                ]  # Shape: (N, comm_target_dim)
+                
+                return embeddings
             
-            # Get target dimensions from config
-            belief_target_dim = config.get("HIDDEN_DIM", 128)
-            comm_target_dim = config.get("COMM_DIM", 64)
-            
-            if entry is None:
+            def lookup_embeddings_jax(agent_ids, agent_xs, agent_ys, ore_type_indices, num_agents_in_fov, action_indices, query_type='belief'):
+                """
+                Wrapper function for JAX-accelerated parallel embedding lookup for coop_mining.
+                
+                Args:
+                    agent_ids: (N,) int array, agent IDs (0 to num_agents-1)
+                    agent_xs: (N,) int array, agent x positions (row)
+                    agent_ys: (N,) int array, agent y positions (col)
+                    ore_type_indices: (N,) int array, ore type indices (0=none, 1=iron, 2=gold)
+                    num_agents_in_fov: (N,) int array, number of agents in FOV
+                    action_indices: (N,) int array, action indices (0-7)
+                    query_type: str, 'belief' or 'communication'
+                    
+                Returns:
+                    (N, target_dim) float32 array of embeddings (belief_target_dim for belief, comm_target_dim for comm)
+                """
                 if query_type == 'belief':
-                    return jnp.zeros(belief_target_dim, dtype=jnp.float32)
+                    return lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, ore_type_indices, num_agents_in_fov, action_indices)
+                else:
+                    return lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, ore_type_indices, num_agents_in_fov, action_indices)
+            
+            # Keep old query function for backward compatibility (non-jitted, single query)
+            def query_dataset(agent_id, agent_x, agent_y, closest_ore_type, num_agents_in_fov, action_idx, 
+                             query_type='belief'):
+                """
+                Query dataset for belief or communication embedding (single query, non-jitted) for coop_mining.
+                For batch queries, use lookup_embeddings_jax instead.
+                
+                Args:
+                    agent_id: int, agent ID (0 to num_agents-1)
+                    agent_x: int, agent x position (row)
+                    agent_y: int, agent y position (col)
+                    closest_ore_type: str or None, closest ore type in FOV ('iron', 'gold', or None/'none')
+                    num_agents_in_fov: int, number of agents in FOV
+                    action_idx: int, action index (0-7)
+                    query_type: str, 'belief' or 'communication'
+                """
+                key_vector = construct_semantic_key_vector(
+                    agent_id, agent_x, agent_y, closest_ore_type, num_agents_in_fov, action_idx
+                )
+                
+                entry = dataset.get(key_vector, None)
+                
+                # Get target dimensions from config
+                belief_target_dim = config.get("HIDDEN_DIM", 128)
+                comm_target_dim = config.get("COMM_DIM", 64)
+                
+                if entry is None:
+                    if query_type == 'belief':
+                        return jnp.zeros(belief_target_dim, dtype=jnp.float32)
+                    else:
+                        return jnp.zeros(comm_target_dim, dtype=jnp.float32)
+                
+                if query_type == 'belief':
+                    embedding = entry.get('belief_embedding', None)
+                    target_dim = belief_target_dim
+                elif query_type == 'communication':
+                    embedding = entry.get('communication_embedding', None)
+                    target_dim = comm_target_dim
                 else:
                     return jnp.zeros(comm_target_dim, dtype=jnp.float32)
+                
+                if embedding is None:
+                    return jnp.zeros(target_dim, dtype=jnp.float32)
+                
+                # Truncate embedding to target dimension
+                embedding_array = np.array(embedding, dtype=np.float32)
+                if embedding_array.shape[0] >= target_dim:
+                    embedding_truncated = embedding_array[:target_dim]
+                else:
+                    # Pad with zeros if shorter than target
+                    embedding_truncated = np.pad(embedding_array, (0, target_dim - embedding_array.shape[0]),
+                                                 mode='constant')
+                
+                # Normalize after truncation
+                embedding_truncated = normalize_l2(embedding_truncated)
+                
+                return jnp.array(embedding_truncated, dtype=jnp.float32)
+        else:
+            # Backward compatibility for coins
+            @jax.jit
+            def lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices):
+                """
+                JAX-accelerated parallel belief embedding lookup.
+                
+                Args:
+                    agent_ids: (N,) int array, agent IDs (0=red, 1=green)
+                    agent_xs: (N,) int array, agent x positions
+                    agent_ys: (N,) int array, agent y positions
+                    coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
+                    action_indices: (N,) int array, action indices (0-6)
+                    
+                Returns:
+                    (N, embedding_dim) float32 array of embeddings
+                """
+                # Encode agent IDs to colors: 0 -> 0 (red), 1 -> 1 (green)
+                color_indices = agent_ids
+                
+                # Clamp indices to valid ranges for safe indexing
+                color_indices = jnp.clip(color_indices, 0, 1)
+                x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
+                y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
+                coin_indices = jnp.clip(coin_color_indices, 0, 2)
+                action_indices_clipped = jnp.clip(action_indices, 0, 6)
+                
+                # Vectorized lookup: belief_embedding_table[color_indices, x_indices, y_indices, coin_indices, action_indices_clipped]
+                embeddings = belief_embedding_table_jax[
+                    color_indices,
+                    x_indices,
+                    y_indices,
+                    coin_indices,
+                    action_indices_clipped
+                ]  # Shape: (N, belief_target_dim)
+                
+                return embeddings
             
-            if query_type == 'belief':
-                embedding = entry.get('belief_embedding', None)
-                target_dim = belief_target_dim
-            elif query_type == 'communication':
-                embedding = entry.get('communication_embedding', None)
-                target_dim = comm_target_dim
-            else:
-                return jnp.zeros(comm_target_dim, dtype=jnp.float32)
+            @jax.jit
+            def lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices):
+                """
+                JAX-accelerated parallel communication embedding lookup.
+                
+                Args:
+                    agent_ids: (N,) int array, agent IDs (0=red, 1=green)
+                    agent_xs: (N,) int array, agent x positions
+                    agent_ys: (N,) int array, agent y positions
+                    coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
+                    action_indices: (N,) int array, action indices (0-6)
+                    
+                Returns:
+                    (N, embedding_dim) float32 array of embeddings
+                """
+                # Encode agent IDs to colors: 0 -> 0 (red), 1 -> 1 (green)
+                color_indices = agent_ids
+                
+                # Clamp indices to valid ranges for safe indexing
+                color_indices = jnp.clip(color_indices, 0, 1)
+                x_indices = jnp.clip(agent_xs, 0, grid_size_row - 1)
+                y_indices = jnp.clip(agent_ys, 0, grid_size_col - 1)
+                coin_indices = jnp.clip(coin_color_indices, 0, 2)
+                action_indices_clipped = jnp.clip(action_indices, 0, 6)
+                
+                # Vectorized lookup: comm_embedding_table[color_indices, x_indices, y_indices, coin_indices, action_indices_clipped]
+                embeddings = comm_embedding_table_jax[
+                    color_indices,
+                    x_indices,
+                    y_indices,
+                    coin_indices,
+                    action_indices_clipped
+                ]  # Shape: (N, comm_target_dim)
+                
+                return embeddings
             
-            if embedding is None:
-                return jnp.zeros(target_dim, dtype=jnp.float32)
+            def lookup_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices, query_type='belief'):
+                """
+                Wrapper function for JAX-accelerated parallel embedding lookup.
+                
+                Args:
+                    agent_ids: (N,) int array, agent IDs (0=red, 1=green)
+                    agent_xs: (N,) int array, agent x positions
+                    agent_ys: (N,) int array, agent y positions
+                    coin_color_indices: (N,) int array, coin color indices (0=none, 1=red, 2=green)
+                    action_indices: (N,) int array, action indices (0-6)
+                    query_type: str, 'belief' or 'communication'
+                    
+                Returns:
+                    (N, target_dim) float32 array of embeddings (belief_target_dim for belief, comm_target_dim for comm)
+                """
+                if query_type == 'belief':
+                    return lookup_belief_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices)
+                else:
+                    return lookup_comm_embeddings_jax(agent_ids, agent_xs, agent_ys, coin_color_indices, action_indices)
             
-            # Truncate embedding to target dimension
-            embedding_array = np.array(embedding, dtype=np.float32)
-            if embedding_array.shape[0] >= target_dim:
-                embedding_truncated = embedding_array[:target_dim]
-            else:
-                # Pad with zeros if shorter than target
-                embedding_truncated = np.pad(embedding_array, (0, target_dim - embedding_array.shape[0]),
-                                             mode='constant')
-            
-            # Normalize after truncation
-            embedding_truncated = normalize_l2(embedding_truncated)
-            
-            return jnp.array(embedding_truncated, dtype=jnp.float32)
+            # Keep old query function for backward compatibility (non-jitted, single query)
+            def query_dataset(agent_id, agent_x, agent_y, closest_coin_color, action_idx, 
+                             query_type='belief'):
+                """
+                Query dataset for belief or communication embedding (single query, non-jitted).
+                For batch queries, use lookup_embeddings_jax instead.
+                """
+                key_vector = construct_semantic_key_vector(
+                    agent_id, agent_x, agent_y, closest_coin_color, action_idx
+                )
+                
+                entry = dataset.get(key_vector, None)
+                
+                # Get target dimensions from config
+                belief_target_dim = config.get("HIDDEN_DIM", 128)
+                comm_target_dim = config.get("COMM_DIM", 64)
+                
+                if entry is None:
+                    if query_type == 'belief':
+                        return jnp.zeros(belief_target_dim, dtype=jnp.float32)
+                    else:
+                        return jnp.zeros(comm_target_dim, dtype=jnp.float32)
+                
+                if query_type == 'belief':
+                    embedding = entry.get('belief_embedding', None)
+                    target_dim = belief_target_dim
+                elif query_type == 'communication':
+                    embedding = entry.get('communication_embedding', None)
+                    target_dim = comm_target_dim
+                else:
+                    return jnp.zeros(comm_target_dim, dtype=jnp.float32)
+                
+                if embedding is None:
+                    return jnp.zeros(target_dim, dtype=jnp.float32)
+                
+                # Truncate embedding to target dimension
+                embedding_array = np.array(embedding, dtype=np.float32)
+                if embedding_array.shape[0] >= target_dim:
+                    embedding_truncated = embedding_array[:target_dim]
+                else:
+                    # Pad with zeros if shorter than target
+                    embedding_truncated = np.pad(embedding_array, (0, target_dim - embedding_array.shape[0]),
+                                                 mode='constant')
+                
+                # Normalize after truncation
+                embedding_truncated = normalize_l2(embedding_truncated)
+                
+                return jnp.array(embedding_truncated, dtype=jnp.float32)
         
-        return {
+        result = {
             'dataset': dataset,  # Keep original for reference
             'query': query_dataset,  # Keep for backward compatibility
             'lookup_jax': lookup_embeddings_jax,  # New JAX-accelerated lookup
@@ -1229,6 +1499,14 @@ def load_offline_llm_dataset(data_path, env_name, config):
             'size': len(dataset),
             'grid_size': (grid_size_row, grid_size_col)
         }
+        
+        # Add coop_mining-specific fields
+        if env_name == "CoopMining" or "coop_mining" in env_name.lower():
+            result['num_agents'] = num_agents
+            result['max_num_agents_in_fov'] = max_num_agents_in_fov
+            result['ore_type_to_idx'] = ore_type_to_idx
+        
+        return result
         
     except Exception as e:
         print(f"Error loading LLM dataset from {data_path}: {e}")
@@ -1720,20 +1998,20 @@ def make_train_comm(config):
                 # Extract directions
                 agent_directions = agent_locs[:, :, 2]  # (num_envs, num_agents)
                 
-                # Find closest coin for each agent using vmap
-                def find_coin_for_agent(agent_x, agent_y, agent_dir, grid_single):
-                    return find_closest_coin_in_fov_jax(
+                # Find closest ore for each agent using vmap
+                def find_ore_for_agent(agent_x, agent_y, agent_dir, grid_single):
+                    return find_closest_ore_in_fov_jax(
                         agent_x, agent_y, agent_dir, grid_single
                     )
                 
                 # Vectorize over environments and agents
                 # Reshape for vmap: (num_envs, num_agents, ...)
-                closest_coin_colors = jax.vmap(
-                    jax.vmap(find_coin_for_agent, in_axes=(0, 0, 0, None)), 
+                closest_ore_types = jax.vmap(
+                    jax.vmap(find_ore_for_agent, in_axes=(0, 0, 0, None)), 
                     in_axes=(0, 0, 0, 0)
                 )(agent_positions[:, :, 0], agent_positions[:, :, 1], agent_directions, grid)
                 # Result: (num_envs, num_agents)
-                closest_coin_colors_flat = closest_coin_colors.reshape(-1)  # (num_envs * num_agents,)
+                closest_ore_types_flat = closest_ore_types.reshape(-1)  # (num_envs * num_agents,)
                 
                 # Store transition
                 if config.get("PARAMETER_SHARING", True):
@@ -1780,7 +2058,7 @@ def make_train_comm(config):
                         prev_comm_batch,  # Store received/aggregated communication that was used as input
                         info,
                         agent_positions_flat,  # Store agent positions for semantic key
-                        closest_coin_colors_flat,  # Store closest coin colors for semantic key
+                        closest_ore_types_flat,  # Store closest ore types for semantic key
                     )
                 else:
                     # NON-PARAMETER SHARING: rewards are per-agent (num_envs,) for each agent
@@ -1807,9 +2085,9 @@ def make_train_comm(config):
                         else:
                             agent_tom_pred = jnp.zeros_like(agent_belief)
                         
-                        # Extract agent positions and coin colors for this agent
+                        # Extract agent positions and ore types for this agent
                         agent_i_positions = agent_positions_flat[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]]
-                        agent_i_coin_colors = closest_coin_colors_flat[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]]
+                        agent_i_ore_types = closest_ore_types_flat[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]]
                         
                         transition.append(TransitionComm(
                             done_list[i],
@@ -1829,7 +2107,7 @@ def make_train_comm(config):
                             prev_comm_batch[i*config["NUM_ENVS"]:(i+1)*config["NUM_ENVS"]],  # Store received/aggregated communication that was used as input
                             info_i,
                             agent_i_positions,  # Store agent positions for semantic key
-                            agent_i_coin_colors,  # Store closest coin colors for semantic key
+                            agent_i_ore_types,  # Store closest ore types for semantic key
                         ))
                 
                 runner_state = (train_state, env_state, obsv, new_hidden_reshaped, aggregated_comm, update_step, rng)
@@ -2129,12 +2407,12 @@ def make_train_comm(config):
                                     
                                     # Get stored semantic key information
                                     agent_positions = traj_batch.agent_positions  # (batch_size, 2)
-                                    closest_coin_colors = traj_batch.closest_coin_colors  # (batch_size,)
+                                    closest_ore_types = traj_batch.closest_ore_types  # (batch_size,)
                                     actions = traj_batch.action  # (batch_size,)
                                     
                                     # Reshape to (num_envs, num_agents, ...)
                                     agent_positions_reshaped = agent_positions.reshape(num_envs, env.num_agents, 2)
-                                    closest_coin_colors_reshaped = closest_coin_colors.reshape(num_envs, env.num_agents)
+                                    closest_ore_types_reshaped = closest_ore_types.reshape(num_envs, env.num_agents)
                                     actions_reshaped = actions.reshape(num_envs, env.num_agents)
                                     
                                     # Use JAX-accelerated parallel lookup for all agents and environments at once
@@ -2144,7 +2422,7 @@ def make_train_comm(config):
                                     agent_ids_flat = jnp.tile(jnp.arange(env.num_agents), num_envs)  # (num_envs * num_agents,)
                                     agent_xs_flat = agent_positions_reshaped[:, :, 0].flatten()  # (num_envs * num_agents,)
                                     agent_ys_flat = agent_positions_reshaped[:, :, 1].flatten()  # (num_envs * num_agents,)
-                                    coin_color_indices_flat = closest_coin_colors_reshaped.flatten()  # (num_envs * num_agents,)
+                                    ore_type_indices_flat = closest_ore_types_reshaped.flatten()  # (num_envs * num_agents,)
                                     action_indices_flat = actions_reshaped.flatten()  # (num_envs * num_agents,)
                                     
                                     # Parallel lookup: all queries processed in one GPU call
@@ -2152,7 +2430,8 @@ def make_train_comm(config):
                                         agent_ids=agent_ids_flat,
                                         agent_xs=agent_xs_flat.astype(jnp.int32),
                                         agent_ys=agent_ys_flat.astype(jnp.int32),
-                                        coin_color_indices=coin_color_indices_flat.astype(jnp.int32),
+                                        ore_type_indices=ore_type_indices_flat.astype(jnp.int32),
+                                        num_agents_in_fov=jnp.zeros_like(ore_type_indices_flat).astype(jnp.int32),  # TODO: add num_agents_in_fov tracking
                                         action_indices=action_indices_flat.astype(jnp.int32),
                                         query_type='belief'
                                     )  # (num_envs * num_agents, embedding_dim)
@@ -2199,12 +2478,12 @@ def make_train_comm(config):
                                 
                                 # Get stored semantic key information
                                 agent_positions = traj_batch.agent_positions  # (batch_size, 2)
-                                closest_coin_colors = traj_batch.closest_coin_colors  # (batch_size,)
+                                closest_ore_types = traj_batch.closest_ore_types  # (batch_size,)
                                 actions = traj_batch.action  # (batch_size,)
                                 
                                 # Reshape to (num_envs, num_agents, ...)
                                 agent_positions_reshaped = agent_positions.reshape(num_envs, env.num_agents, 2)
-                                closest_coin_colors_reshaped = closest_coin_colors.reshape(num_envs, env.num_agents)
+                                closest_ore_types_reshaped = closest_ore_types.reshape(num_envs, env.num_agents)
                                 actions_reshaped = actions.reshape(num_envs, env.num_agents)
                                 
                                 # Use JAX-accelerated parallel lookup for all agents and environments at once
@@ -2212,7 +2491,7 @@ def make_train_comm(config):
                                 agent_ids_flat = jnp.tile(jnp.arange(env.num_agents), num_envs)  # (num_envs * num_agents,)
                                 agent_xs_flat = agent_positions_reshaped[:, :, 0].flatten()  # (num_envs * num_agents,)
                                 agent_ys_flat = agent_positions_reshaped[:, :, 1].flatten()  # (num_envs * num_agents,)
-                                coin_color_indices_flat = closest_coin_colors_reshaped.flatten()  # (num_envs * num_agents,)
+                                ore_type_indices_flat = closest_ore_types_reshaped.flatten()  # (num_envs * num_agents,)
                                 action_indices_flat = actions_reshaped.flatten()  # (num_envs * num_agents,)
                                 
                                 # Parallel lookup: all queries processed in one GPU call
@@ -2220,7 +2499,8 @@ def make_train_comm(config):
                                     agent_ids=agent_ids_flat,
                                     agent_xs=agent_xs_flat.astype(jnp.int32),
                                     agent_ys=agent_ys_flat.astype(jnp.int32),
-                                    coin_color_indices=coin_color_indices_flat.astype(jnp.int32),
+                                    ore_type_indices=ore_type_indices_flat.astype(jnp.int32),
+                                    num_agents_in_fov=jnp.zeros_like(ore_type_indices_flat).astype(jnp.int32),  # TODO: add num_agents_in_fov tracking
                                     action_indices=action_indices_flat.astype(jnp.int32),
                                     query_type='communication'
                                 )  # (num_envs * num_agents, embedding_dim)
@@ -2458,6 +2738,12 @@ def make_train_comm(config):
             # Coin-specific metric (skip for coop_mining)
             if "eat_own_coins" in metric:
                 metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+            
+            # Coop_mining-specific metrics: gold and iron ore mined
+            if "mining_gold" in metric:
+                metric["ore_mined/gold"] = metric["mining_gold"]
+            if "mining_iron" in metric:
+                metric["ore_mined/iron"] = metric["mining_iron"]
             
             # Log social influence rewards separately if enabled
             if config.get("SOCIAL_INFLUENCE_COEFF", 0.0) > 0.0:
@@ -2888,6 +3174,13 @@ def make_train(config):
             # Coin-specific metric (skip for coop_mining)
             if "eat_own_coins" in metric:
                 metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+            
+            # Coop_mining-specific metrics: gold and iron ore mined
+            if "mining_gold" in metric:
+                metric["ore_mined/gold"] = metric["mining_gold"]
+            if "mining_iron" in metric:
+                metric["ore_mined/iron"] = metric["mining_iron"]
+            
             jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, update_step, rng)
@@ -2908,29 +3201,29 @@ def single_run(config):
     use_comm = config.get("USE_COMM", False)
     param_sharing = config.get("PARAMETER_SHARING", False)
     
-    # Build tags
-    if use_comm:
-        tags = ["LGTOM", "COMM"]
-        name_suffix = "lgtom_comm"
-    else:
-        tags = ["IPPO", "FF"]
-        name_suffix = "ippo_cnn"
+    # # Build tags
+    # if use_comm:
+    #     tags = ["LGTOM", "COMM"]
+    #     name_suffix = "lgtom_comm"
+    # else:
+    #     tags = ["IPPO", "FF"]
+    #     name_suffix = "ippo_cnn"
     
-    # Add parameter sharing to tags and name
-    if param_sharing:  # Comm always uses parameter sharing
-        tags.append("PS")
-        name_suffix += "_ps"
-    else:
-        tags.append("IND")
-        name_suffix += "_ind"
+    # # Add parameter sharing to tags and name
+    # if param_sharing:  # Comm always uses parameter sharing
+    #     tags.append("PS")
+    #     name_suffix += "_ps"
+    # else:
+    #     tags.append("IND")
+    #     name_suffix += "_ind"
     
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=tags,
+        tags=["LGTOM", "COMM", "ToM",'Intrinsic','Ground_truth'],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'{name_suffix}_coop_mining'
+        name=f'social_coop_mining'
     )
 
     rng = jax.random.PRNGKey(config["SEED"])

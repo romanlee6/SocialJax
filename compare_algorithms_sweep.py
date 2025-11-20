@@ -1,23 +1,13 @@
 """
-Unified WandB sweep script to compare LG-TOM variants, InfoPG, and AutoEncoder
-on Coin Game with consistent hyperparameters.
+Unified WandB sweep script to compare methods on Coop Mining environment.
 
 Usage:
     python compare_algorithms_sweep.py
 
-Running this file now launches two WandB sweeps:
-
-1. LG-TOM Variants (Default Settings)
-   - Experiments: Social Influence, LG-ToM, LangGround, Proto
-   - Seeds: [1, 2, 3]
-   - Individual rewards (shared_rewards=False), no parameter sharing,
-     joint reward heads.
-
-2. All Methods (Shared Setup)
-   - Experiments: Social Influence, LG-ToM, LangGround, Proto, AutoEncoder, InfoPG
-   - Seeds: [1, 2, 3]
-   - Shared rewards (shared_rewards=True), parameter sharing enabled,
-     separate reward heads (USE_SEPARATE_REWARDS=True).
+Running this file launches a WandB sweep comparing:
+   - Social Influence, Proto, InfoPG, AutoEncoder
+   - Seeds: [42,52,62,110]
+   - Fixed settings: individual rewards, no parameter sharing, joint reward heads
 """
 import sys
 import os
@@ -46,16 +36,16 @@ def import_module_from_path(module_name, file_path):
 # Handle hyphenated directory name "LG-TOM"
 base_path = Path(__file__).parent
 lgtom_module = import_module_from_path(
-    "lgtom_cnn_coins",
-    base_path / "algorithms" / "LG-TOM" / "lgtom_cnn_coins.py"
+    "lgtom_cnn_coop_mining",
+    base_path / "algorithms" / "LG-TOM" / "lgtom_cnn_coop_mining.py"
 )
 infopg_module = import_module_from_path(
-    "infopg_cnn_coins",
-    base_path / "algorithms" / "InfoPG" / "infopg_cnn_coins.py"
+    "infopg_cnn_coop_mining",
+    base_path / "algorithms" / "InfoPG" / "infopg_cnn_coop_mining.py"
 )
 autoencoder_module = import_module_from_path(
-    "autoencoder_cnn_coins",
-    base_path / "algorithms" / "AutoEncoder" / "autoencoder_cnn_coins.py"
+    "autoencoder_cnn_coop_mining",
+    base_path / "algorithms" / "AutoEncoder" / "autoencoder_cnn_coop_mining.py"
 )
 
 make_train_lgtom = lgtom_module.make_train_comm
@@ -65,9 +55,9 @@ make_train_autoencoder = autoencoder_module.make_train_comm
 def load_config(algorithm_name):
     """Load default config for each algorithm by reading YAML directly"""
     config_name_map = {
-        "lgtom": "lgtom_cnn_coins",
-        "infopg": "infopg_cnn_coins",
-        "autoencoder": "autoencoder_cnn_coins"
+        "lgtom": "lgtom_cnn_coop_mining",
+        "infopg": "infopg_cnn_coop_mining",
+        "autoencoder": "autoencoder_cnn_coop_mining"
     }
     
     # Handle hyphenated directory name for LG-TOM
@@ -88,23 +78,32 @@ def create_base_config():
     """Create base configuration with common settings"""
     return {
         "SEED": 1,  # Default seed, will be overridden by sweep parameter
-        "TOTAL_TIMESTEPS": 1e8,
+        "TOTAL_TIMESTEPS": 2e7,
         "REWARD": "individual",
         "PARAMETER_SHARING": False,
         "USE_SEPARATE_REWARDS": False,  # Joint rewards
         "ENV_KWARGS": {
             "shared_rewards": False,
-            "num_agents": 2,
-            "num_inner_steps": 1000,
+            "num_agents": 6,
+            "num_inner_steps": 996,
+            "num_outer_steps": 1,
+            "max_miners": 4,
+            "min_gold_miners": 2,
+            "mining_range": 3,
+            "reward_iron": 1.0,
+            "reward_gold": 8.0,
+            "gold_mining_window": 3,
+            "regrowth_prob_iron": 0.0004,
+            "regrowth_prob_gold": 0.00016,
             "cnn": True,
             "jit": True,
         },
         # Common training hyperparameters
         "LR": 0.0005,
-        "NUM_ENVS": 512,
-        "NUM_STEPS": 1000,
+        "NUM_ENVS": 256,
+        "NUM_STEPS": 996,
         "UPDATE_EPOCHS": 2,
-        "NUM_MINIBATCHES": 500,
+        "NUM_MINIBATCHES": 256,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -112,7 +111,7 @@ def create_base_config():
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "relu",
-        "ENV_NAME": "coin_game",
+        "ENV_NAME": "coop_mining",
         "REW_SHAPING_HORIZON": 2.5e6,
         "SHAPING_BEGIN": 1e6,
         "ANNEAL_LR": True,
@@ -226,11 +225,9 @@ def wrapped_make_train():
     # Define all experiments explicitly
     experiments = {
         0: {"algorithm": "lgtom", "variant": "social_influence", "name": "Social Influence"},
-        1: {"algorithm": "lgtom", "variant": "lgtom", "name": "LG-ToM"},
-        2: {"algorithm": "lgtom", "variant": "langground", "name": "LangGround"},
-        3: {"algorithm": "lgtom", "variant": "proto", "name": "Proto"},
-        4: {"algorithm": "autoencoder", "variant": None, "name": "AutoEncoder"},
-        5: {"algorithm": "infopg", "variant": None, "name": "InfoPG"},
+        1: {"algorithm": "lgtom", "variant": "proto", "name": "Proto"},
+        2: {"algorithm": "infopg", "variant": None, "name": "InfoPG"},
+        3: {"algorithm": "autoencoder", "variant": None, "name": "AutoEncoder"},
     }
     
     if experiment_id not in experiments:
@@ -354,17 +351,18 @@ def main():
 
     sweeps = [
         {
-            "title": "Benchmarking Experiments (Fix comm loss and gradient flow)",
-            "experiment_ids": [0, 1, 2, 3, 4, 5],
-            "seeds": [220, 330, 42],
+            "title": "Coop Mining Comparison: Social Influence, Proto, InfoPG, AutoEncoder",
+            "experiment_ids": [0, 1, 2, 3],
+            "seeds": [62],
             "extra_params": {
                 "shared_rewards": False,
                 "PARAMETER_SHARING": False,
                 "USE_SEPARATE_REWARDS": False,
             },
             "description": (
-                "All algorithms using individual rewards, no parameter sharing, "
-                "and joint reward heads."
+                "Comparing methods on coop_mining environment: "
+                "Social Influence, Proto, InfoPG, AutoEncoder. "
+                "Fixed settings: individual rewards, no parameter sharing, joint reward heads."
             ),
         },
     ]

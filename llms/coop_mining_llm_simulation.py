@@ -59,7 +59,7 @@ class ObservationDescriptor:
     
     # Coordinate system: (0,0) is at top-left, row increases down, col increases right
     # direction 0=North, 1=East, 2=South, 3=West
-    DIRECTION_NAMES = ["North", "East", "South", "West"]
+    DIRECTION_NAMES = ["Up", "Right", "Down", "Left"]
     
     def __init__(self, agent_id: int, team_color: str):
         self.agent_id = agent_id
@@ -67,7 +67,8 @@ class ObservationDescriptor:
         
     def describe_observation(self, obs: np.ndarray, agent_loc: np.ndarray, 
                            all_agent_locs: np.ndarray, grid: np.ndarray,
-                           received_messages: List[str] = None) -> str:
+                           received_messages: List[str] = None,
+                           mining_feedback: str = None) -> str:
         """
         Convert observation array to natural language description.
         
@@ -77,6 +78,7 @@ class ObservationDescriptor:
             all_agent_locs: All agents' locations from state
             grid: Full grid state
             received_messages: List of messages from other agents to append to observation
+            mining_feedback: Feedback about previous mining attempt (if any)
             
         Returns:
             Natural language description of the observation
@@ -85,8 +87,36 @@ class ObservationDescriptor:
         
         # Agent's position and orientation
         agent_row, agent_col, direction = int(agent_loc[0]), int(agent_loc[1]), int(agent_loc[2])
+        direction_name = self.DIRECTION_NAMES[direction]
         desc_parts.append(f"You are Agent {self.agent_id}.")
         desc_parts.append(f"Your position: row {agent_row}, col {agent_col}.")
+        desc_parts.append(f"Your orientation: facing {direction_name}.")
+        
+        # Check for adjacent walls (within 1 step in cardinal directions)
+        adjacent_walls = []
+        grid_rows, grid_cols = grid.shape[0], grid.shape[1]
+        
+        # Check up (decrease row)
+        if agent_row > 0 and grid[agent_row - 1, agent_col] == Items.wall:
+            adjacent_walls.append(("up", agent_row - 1, agent_col))
+        
+        # Check down (increase row)
+        if agent_row < grid_rows - 1 and grid[agent_row + 1, agent_col] == Items.wall:
+            adjacent_walls.append(("down", agent_row + 1, agent_col))
+        
+        # Check left (decrease col)
+        if agent_col > 0 and grid[agent_row, agent_col - 1] == Items.wall:
+            adjacent_walls.append(("left", agent_row, agent_col - 1))
+        
+        # Check right (increase col)
+        if agent_col < grid_cols - 1 and grid[agent_row, agent_col + 1] == Items.wall:
+            adjacent_walls.append(("right", agent_row, agent_col + 1))
+        
+        # Add wall description if any adjacent walls found
+        if adjacent_walls:
+            desc_parts.append("\n=== Adjacent Walls ===")
+            for direction_name, wall_row, wall_col in adjacent_walls:
+                desc_parts.append(f"  - Wall {direction_name} of you at position (row {wall_row}, col {wall_col})")
         
         # The observation FOV is asymmetric and depends on orientation
         # FOV: forward=9, backward=1, left=5, right=5 (11x11 total)
@@ -209,12 +239,23 @@ class ObservationDescriptor:
         if not iron_ores and not gold_ores and not gold_partials:
             desc_parts.append("\nNo ores visible in your field of view.")
             
-        # Describe other agents
+        # Describe other agents with their IDs
         if other_agents:
             desc_parts.append(f"\nOther agents ({len(other_agents)} visible):")
             for obj_row, obj_col, rel_row, rel_col in other_agents:
+                # Find which agent this is by matching position
+                agent_id = None
+                for i, other_loc in enumerate(all_agent_locs):
+                    if i != self.agent_id:
+                        other_row, other_col = int(other_loc[0]), int(other_loc[1])
+                        if other_row == obj_row and other_col == obj_col:
+                            agent_id = i
+                            break
                 direction_desc = self._relative_position_desc(rel_row, rel_col)
-                desc_parts.append(f"  - Agent at position (row {obj_row}, col {obj_col}) - {direction_desc}")
+                if agent_id is not None:
+                    desc_parts.append(f"  - Agent {agent_id} at position (row {obj_row}, col {obj_col}) - {direction_desc}")
+                else:
+                    desc_parts.append(f"  - Agent at position (row {obj_row}, col {obj_col}) - {direction_desc}")
         
         # Append messages to observation if provided
         if received_messages:
@@ -224,6 +265,11 @@ class ObservationDescriptor:
         elif received_messages is not None:
             desc_parts.append("\n=== Messages from Other Agents ===")
             desc_parts.append("  - No messages received.")
+        
+        # Append mining feedback if provided
+        if mining_feedback:
+            desc_parts.append("\n=== Mining Feedback ===")
+            desc_parts.append(mining_feedback)
         
         return "\n".join(desc_parts)
     
@@ -353,6 +399,87 @@ def find_closest_ore_in_fov(agent_row: int, agent_col: int, agent_direction: int
                     closest_ore = "gold_partial"
     
     return closest_ore
+
+
+def generate_mining_feedback(agent_id: int, action_str: str, reward: float,
+                             agent_row: int, agent_col: int, agent_direction: int,
+                             grid: np.ndarray) -> Optional[str]:
+    """
+    Generate feedback about mining attempt.
+    
+    Args:
+        agent_id: Agent ID
+        action_str: Action string (should be "mine" if mining was attempted)
+        reward: Reward received (positive if mining successful)
+        agent_row: Agent's row position at time of mining
+        agent_col: Agent's col position at time of mining
+        agent_direction: Agent's facing direction at time of mining (0=North, 1=East, 2=South, 3=West)
+        grid: Grid state at time of mining (before action was applied)
+        
+    Returns:
+        Feedback string or None if no mining was attempted
+    """
+    if action_str != "mine":
+        return None
+    
+    # Check if mining was successful (positive reward)
+    if reward > 0:
+        return f"Mining successful! You received a reward of {reward:.1f}."
+    
+    # Mining failed - determine reason
+    # Direction vectors: 0=North (-1,0), 1=East (0,1), 2=South (1,0), 3=West (0,-1)
+    direction_vectors = {
+        0: (-1, 0),  # North
+        1: (0, 1),   # East
+        2: (1, 0),   # South
+        3: (0, -1)   # West
+    }
+    
+    dr, dc = direction_vectors[agent_direction]
+    mining_range = 3
+    
+    # Check positions in front of agent
+    ore_found = False
+    ore_at_position = False
+    ore_positions = []
+    
+    for i in range(1, mining_range + 1):
+        check_row = agent_row + dr * i
+        check_col = agent_col + dc * i
+        
+        # Check bounds
+        if check_row < 0 or check_row >= grid.shape[0] or check_col < 0 or check_col >= grid.shape[1]:
+            break
+        
+        cell = grid[check_row, check_col]
+        
+        # If we hit a wall, stop checking
+        if cell == Items.wall:
+            break
+        
+        # Check for ores
+        if cell in [Items.iron_ore, Items.gold_ore, Items.gold_partial]:
+            ore_found = True
+            ore_positions.append((check_row, check_col, i))
+    
+    # Check if agent is at an ore position (shouldn't happen, but check anyway)
+    if grid[agent_row, agent_col] in [Items.iron_ore, Items.gold_ore, Items.gold_partial]:
+        ore_at_position = True
+    
+    # Generate feedback based on findings
+    if ore_at_position:
+        return "Mining failed: You are at the ore position. You must be at least1 unit away from the ore to mine it."
+    elif not ore_found:
+        return "Mining failed: No ore found in front of you within mining range (up to 3 tiles ahead in your facing direction)."
+    else:
+        # Ore found but mining failed - check distances
+        closest_dist = min(dist for _, _, dist in ore_positions)
+        if closest_dist > 1:
+            return f"Mining failed: The closest ore is {closest_dist} unit(s) away. You must be within 3 units of the ore and facing the ore to mine it."
+        else:
+            # Ore is at distance 1 but mining still failed
+            # This could be due to coordination requirements for gold ore or other game mechanics
+            return "Mining failed: You are facing an ore, but mining was unsuccessful. This may be due to coordination requirements for gold ore (gold requires two agents to mine together) or other game mechanics."
 
 
 def count_agents_in_fov(agent_id: int, agent_row: int, agent_col: int, 
@@ -595,10 +722,10 @@ ENVIRONMENT DESCRIPTION:
 - Two types of ore spawn randomly in empty spaces: iron ore (gray) and gold ore (yellow)
 - You are equipped with a mining beam that attempts to extract ore in front of you
 - Iron ore can be mined individually and provides a reward of +1 upon extraction
-- Gold ore requires group coordination: it must be mined by exactly two players within a time window of 3 timesteps
+- Gold ore requires group coordination: it can be mined by two to fourplayers within a time window of 3 timesteps
 - When you mine gold ore, it flashes (becomes "gold_partial") to indicate it is ready to be mined by another player
 - If no other player helps within 3 timesteps, or if too many players try to mine, the gold ore reverts back to normal
-- Gold ore yields a reward of +8 to each of the two miners when successfully extracted
+- Gold ore yields a reward of +8 to each of the miners within the group when successfully extracted
 
 MAP AND COORDINATE SYSTEM:
 - Map size: 27 rows × 27 columns grid
@@ -617,15 +744,15 @@ FIELD OF VIEW (FOV):
 
 REWARD STRUCTURE:
 - Mining iron ore: +1 point (reliable, no coordination needed)
-- Mining gold ore successfully (with another player): +8 points each (higher payoff, requires coordination)
+- Mining gold ore successfully (with other players): +8 points each (higher payoff, requires coordination)
 - Mining gold ore alone: 0 points (no reward if no one else helps)
 - Mining has an opportunity cost: while mining gold, you're not mining iron
 
-STRATEGIC CONSIDERATIONS:
-- Mining iron has a reliable payoff without needing to coordinate with others
-- Mining gold has an opportunity cost (not mining iron), but if no one else helps, you get no reward
-- However, if two players stick together (spatially) and go around mining gold, they will both receive higher reward than if they were mining iron
-- Selfish agents tend to mine iron ore more, while cooperative agents will try to cooperate and mine gold ore
+# STRATEGIC CONSIDERATIONS:
+# - Mining iron has a reliable payoff without needing to coordinate with others
+# - Mining gold has an opportunity cost (not mining iron), but if no one else helps, you get no reward
+# - However, if two players stick together (spatially) and go around mining gold, they will both receive higher reward than if they were mining iron
+# - Selfish agents tend to mine iron ore more, while cooperative agents will try to cooperate and mine gold ore
 
 COMMUNICATION:
 - You can send messages to other agents
@@ -641,6 +768,14 @@ AVAILABLE ACTIONS:
 - right: Move right (increase col value)
 - stay: Stay in place
 - mine: Activate mining beam to extract ore in front of you (up to 3 tiles ahead)
+
+MINING CONSTRAINTS:
+- You can only mine ore when you are within 3 units away from the ore and FACING the ore
+- You CANNOT mine ore when:
+  * You are at the same position as the ore (you must be at least1 unit away)
+  * You are not facing the ore (the ore must be directly in front of you)
+  * There is no ore within mining range (up to 3 tiles ahead in your facing direction)
+- Mining checks for ore in a straight line in your facing direction, up to 3 tiles ahead
 
 OUTPUT FORMAT (must follow exactly):
 BELIEF: [One sentence describing your current understanding of the situation including current position, next goal, and general game strategy.]
@@ -1355,7 +1490,9 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
         num_inner_steps=1000,
         shared_rewards=False,
         cnn=True,
-        jit=True
+        jit=True,
+        regrowth_prob_iron=0.0004,
+        regrowth_prob_gold=0.00016,
     )
     
     # Configure JAX memory management
@@ -1405,12 +1542,37 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
     cumulative_iron_mined = np.array([0.0] * num_agents)
     cumulative_gold_mined = np.array([0.0] * num_agents)
     
+    # Track previous actions and state for mining feedback
+    prev_actions_str = [None] * num_agents
+    prev_state_np = None
+    
     for t in range(num_steps):
         timestep_start = time.time()
         print(f"Timestep {t}/{num_steps-1}", end="\r")
         
         # Get messages for each agent (from previous timestep)
         agent_messages = [comm_manager.get_messages(i) for i in range(num_agents)]
+        
+        # Generate mining feedback from previous timestep (if any)
+        mining_feedbacks = []
+        if prev_state_np is not None:
+            for i in range(num_agents):
+                if prev_actions_str[i] == "mine":
+                    # Use previous state to check conditions at time of mining
+                    prev_agent_row = int(prev_state_np.agent_locs[i][0])
+                    prev_agent_col = int(prev_state_np.agent_locs[i][1])
+                    prev_agent_direction = int(prev_state_np.agent_locs[i][2])
+                    # Use previous grid state to check what was there when mining was attempted
+                    feedback = generate_mining_feedback(
+                        i, prev_actions_str[i], rewards[i],
+                        prev_agent_row, prev_agent_col, prev_agent_direction,
+                        prev_state_np.grid  # Use previous grid to check conditions at time of mining
+                    )
+                    mining_feedbacks.append(feedback)
+                else:
+                    mining_feedbacks.append(None)
+        else:
+            mining_feedbacks = [None] * num_agents
         
         # Generate observations for each agent (with messages appended)
         obs_start = time.time()
@@ -1423,17 +1585,19 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
                 state_np.agent_locs[i],
                 state_np.agent_locs,
                 state_np.grid,
-                received_messages=None  # No messages
+                received_messages=None,  # No messages
+                mining_feedback=None  # No mining feedback in plain observation
             )
             plain_observations.append(plain_obs)
             
-            # Full observation with messages
+            # Full observation with messages and mining feedback
             obs_desc = agent.descriptor.describe_observation(
                 obs_np[i], 
                 state_np.agent_locs[i],
                 state_np.agent_locs,
                 state_np.grid,
-                received_messages=agent_messages[i]  # Append messages to observation
+                received_messages=agent_messages[i],  # Append messages to observation
+                mining_feedback=mining_feedbacks[i]  # Append mining feedback
             )
             observations.append(obs_desc)
         obs_time = time.time() - obs_start
@@ -1527,23 +1691,25 @@ def run_simulation(num_steps: int = 50, save_dir: str = "./llm_simulation_output
         
         # Visualize with new state (convert back to JAX for rendering, but use concrete values)
         # Only render every Nth timestep to save memory and time
-        if t % 5 == 0 or t == num_steps - 1:
-            try:
-                # Convert numpy state back to JAX for rendering
-                state_for_render = jax.tree_util.tree_map(lambda x: jnp.array(x), state_new_np)
-                visualizer.render_timestep(
-                    t, env, state_for_render, observations, communications,
-                    actions_str, beliefs, rewards_new_np, plain_observations=plain_observations
-                )
-                # Clear the render state to free memory
-                del state_for_render
-            except Exception as e:
-                # If rendering fails (e.g., due to JAX tracing issues), skip this frame
-                print(f"\nWarning: Failed to render timestep {t}: {e}")
-                pass
+
+        try:
+            # Convert numpy state back to JAX for rendering
+            state_for_render = jax.tree_util.tree_map(lambda x: jnp.array(x), state_new_np)
+            visualizer.render_timestep(
+                t, env, state_for_render, observations, communications,
+                actions_str, beliefs, rewards_new_np, plain_observations=plain_observations
+            )
+            # Clear the render state to free memory
+            del state_for_render
+        except Exception as e:
+            # If rendering fails (e.g., due to JAX tracing issues), skip this frame
+            print(f"\nWarning: Failed to render timestep {t}: {e}")
+            pass
         
         # Update state for next iteration
         obs_np = obs_new_np
+        prev_state_np = state_np  # Save previous state for mining feedback
+        prev_actions_str = actions_str.copy()  # Save previous actions for mining feedback
         state_np = state_new_np
         rewards = rewards_new_np
         
